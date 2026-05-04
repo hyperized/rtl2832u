@@ -90,6 +90,30 @@ func (m *mockController) controlOut(req uint8, value, index uint16, data []byte)
 	return len(data), nil
 }
 
+// countingController wraps mockController and starts returning
+// errFakeControlOut after a configurable number of OUT calls have
+// succeeded. Useful for tests that need to drive a multi-stage
+// operation to its Nth write before injecting a failure.
+type countingController struct {
+	*mockController
+
+	failAfter int
+	outCount  int
+}
+
+func (c *countingController) controlIn(req uint8, value, index uint16, data []byte) (int, error) {
+	return c.mockController.controlIn(req, value, index, data)
+}
+
+func (c *countingController) controlOut(req uint8, value, index uint16, data []byte) (int, error) {
+	c.outCount++
+	if c.outCount > c.failAfter {
+		return 0, errFakeControlOut
+	}
+
+	return c.mockController.controlOut(req, value, index, data)
+}
+
 func TestEncodeBlockIndex(t *testing.T) {
 	t.Parallel()
 
