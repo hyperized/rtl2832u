@@ -37,7 +37,7 @@ linters:
         - name: cyclomatic
           arguments: [ 15 ]
     mnd:
-      ignored-numbers: [ 0,1,2,3 ]
+      ignored-numbers: [ "0", "1", "2", "3" ]
     funlen:
       lines: 120
 
