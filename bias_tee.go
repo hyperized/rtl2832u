@@ -50,8 +50,6 @@ const (
 	// defaultBiasTeeGPIO is the GPIO pin librtlsdr drives for
 	// bias-tee on every common RTL-SDR dongle. Clones with
 	// non-standard wiring need to override via SetBiasTeeGPIO.
-	//
-	//nolint:unused // surfaced via WithBiasTee in a follow-up commit.
 	defaultBiasTeeGPIO uint8 = 0
 
 	// biasTeeMaxGPIO is the largest GPIO index the chip exposes

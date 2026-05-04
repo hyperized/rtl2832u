@@ -53,11 +53,6 @@ var r860MixerGainSteps = [r860GainStepCount]int{
 // it "16.3 dB" — the dB scale rounds to that on slightly older
 // silicon revisions; we use the documented 3.5 dB/step from the
 // datasheet.
-//
-// Pinned here next to the librtlsdr table it derives from; the
-// public WithGain Option (added later) consumes it.
-//
-//nolint:unused // surfaced via WithGain in a follow-up commit.
 const librtlsdrManualVGAStep uint8 = 8
 
 // librtlsdrGainSteps walks the LNA / Mixer delta tables to find

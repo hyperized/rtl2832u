@@ -12,3 +12,18 @@
 // return ErrUnsupportedPlatform from Open so callers can compile
 // and test on dev machines without a dongle attached.
 package rtl2832u
+
+// DefaultCenterFreqHz is the ADS-B 1090 MHz Extended Squitter
+// centre frequency. It's the default this package was developed
+// against; reuse the package for other narrowband targets by
+// passing WithCenterFreq.
+const DefaultCenterFreqHz uint32 = 1_090_000_000
+
+// DefaultSampleRateHz is the sample rate FlightAware dump1090
+// uses — 2.4 samples per bit at the Mode S 1 µs bit period.
+const DefaultSampleRateHz uint32 = 2_400_000
+
+// GainAGC is the sentinel value that selects automatic gain
+// control instead of a fixed tuner gain. -1 falls outside the
+// chip's 0..15 step range so it cannot collide with a real value.
+const GainAGC int = -1
