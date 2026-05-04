@@ -18,7 +18,7 @@ jobs:
     steps:
       - name: Fetch Dependabot metadata
         id: meta
-        uses: dependabot/fetch-metadata@v2
+        uses: dependabot/fetch-metadata@v3
 
       # Restrict auto-merge to non-major bumps. Major upgrades may carry
       # breaking changes worth a manual look; they still open as PRs but
