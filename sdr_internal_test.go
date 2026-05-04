@@ -196,6 +196,29 @@ func TestWithBiasTeeGPIOOverridesPin(t *testing.T) {
 	}
 }
 
+func TestWithAutoGainEnablesFlag(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+
+	// Pre-set per-stage manual values so we can confirm WithAutoGain
+	// resets them.
+	cfg.lnaGain = ManualGainStep(5)
+	cfg.mixerGain = ManualGainStep(5)
+	cfg.vgaGain = ManualGainStep(5)
+
+	WithAutoGain()(&cfg)
+
+	if !cfg.autoGain {
+		t.Error("autoGain = false, want true")
+	}
+
+	if cfg.lnaGain != AutoGain || cfg.mixerGain != AutoGain || cfg.vgaGain != AutoGain {
+		t.Errorf("stages not reset: lna=%+v mixer=%+v vga=%+v",
+			cfg.lnaGain, cfg.mixerGain, cfg.vgaGain)
+	}
+}
+
 func TestPerStageOptionsOverrideWithGain(t *testing.T) {
 	t.Parallel()
 
@@ -619,6 +642,8 @@ type fakeBackend struct {
 	dropped     uint64
 	stats       SignalStats
 	statsErr    error
+	tuneResult  AutoTuneResult
+	tuneErr     error
 }
 
 func (f *fakeBackend) Read(_ context.Context, _ []byte) (int, error) {
@@ -637,6 +662,10 @@ func (f *fakeBackend) DroppedSampleChunks() uint64 {
 
 func (f *fakeBackend) SignalStats() (SignalStats, error) {
 	return f.stats, f.statsErr
+}
+
+func (f *fakeBackend) AutoTuneGain(_ context.Context, _ AutoTuneOptions) (AutoTuneResult, error) {
+	return f.tuneResult, f.tuneErr
 }
 
 func TestReceiverReadDelegatesToBackend(t *testing.T) {
@@ -730,6 +759,41 @@ func TestReceiverSignalStatsWrapsBackendError(t *testing.T) {
 	rcv := &Receiver{cfg: defaultConfig(), backend: fake}
 
 	if _, err := rcv.SignalStats(); !errors.Is(err, errFakeRead) {
+		t.Errorf("err = %v, want wrapping errFakeRead", err)
+	}
+}
+
+func TestReceiverAutoTuneGainDelegates(t *testing.T) {
+	t.Parallel()
+
+	want := AutoTuneResult{
+		LNA:        ManualGainStep(12),
+		Mixer:      ManualGainStep(15),
+		VGA:        ManualGainStep(15),
+		FinalIFAGC: -1500,
+		Iterations: 4,
+	}
+
+	fake := &fakeBackend{tuneResult: want}
+	rcv := &Receiver{cfg: defaultConfig(), backend: fake}
+
+	got, err := rcv.AutoTuneGain(t.Context(), AutoTuneOptions{})
+	if err != nil {
+		t.Fatalf("AutoTuneGain: %v", err)
+	}
+
+	if got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestReceiverAutoTuneGainWrapsBackendError(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeBackend{tuneErr: errFakeRead}
+	rcv := &Receiver{cfg: defaultConfig(), backend: fake}
+
+	if _, err := rcv.AutoTuneGain(t.Context(), AutoTuneOptions{}); !errors.Is(err, errFakeRead) {
 		t.Errorf("err = %v, want wrapping errFakeRead", err)
 	}
 }

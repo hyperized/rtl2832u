@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -145,7 +146,41 @@ func openBackendWithSysfs(cfg config, root string) (backend, error) {
 		return nil, err
 	}
 
+	if cfg.autoGain {
+		if err := runAutoTuneAtOpen(back); err != nil {
+			_ = back.Close()
+
+			return nil, err
+		}
+	}
+
 	return back, nil
+}
+
+// runAutoTuneAtOpen executes the auto-tune algorithm during the
+// open flow and logs its converged configuration to stderr via
+// stdlib `log`. Extracted to keep openBackendWithSysfs's cyclomatic
+// complexity within revive's threshold.
+//
+// Open does not currently take a context, so the auto-tune runs
+// against a background context — meaning the caller cannot
+// cancel a tune mid-flight. The algorithm self-bounds at 16
+// iterations (~16 seconds), so the worst case is bounded.
+func runAutoTuneAtOpen(back *linuxBackend) error {
+	//nolint:contextcheck // Open API has no ctx; algorithm self-bounds at ~16s.
+	result, err := back.AutoTuneGain(context.Background(), AutoTuneOptions{})
+	if err != nil {
+		return fmt.Errorf("rtl2832u: auto-tune gain: %w", err)
+	}
+
+	log.Printf(
+		"rtl2832u: auto-tune converged: LNA=step%d Mixer=step%d VGA=step%d "+
+			"if_agc_mean=%d iterations=%d",
+		result.LNA.Step, result.Mixer.Step, result.VGA.Step,
+		result.FinalIFAGC, result.Iterations,
+	)
+
+	return nil
 }
 
 // selectDevice resolves the requested device index against the
@@ -464,5 +499,12 @@ func (b *linuxBackend) DroppedSampleChunks() uint64 {
 // issue concurrently with active sample streaming.
 func (b *linuxBackend) SignalStats() (SignalStats, error) {
 	return b.chip.readSignalStats()
+}
+
+// AutoTuneGain satisfies the backend interface. Runs the
+// gradient-descent search defined in autotune.go against the
+// retained tuner and the demod's AGC readback registers.
+func (b *linuxBackend) AutoTuneGain(ctx context.Context, opts AutoTuneOptions) (AutoTuneResult, error) {
+	return autoTuneGain(ctx, b.tuner, b, opts)
 }
 

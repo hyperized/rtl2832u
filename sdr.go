@@ -36,6 +36,11 @@ type Option func(*config)
 // / WithMixerGain / WithVGAGain) can layer cleanly on top of the
 // convenience WithGain knob. Functional options apply in the order the
 // caller passed them — last write to a stage wins.
+//
+// autoGain, if true, replaces the per-stage values at Open time by
+// running the auto-tune search. The per-stage fields still capture
+// the post-tune state so callers can read them back via SignalStats
+// + tuner getters in a future iteration.
 type config struct {
 	centerFreqHz uint32
 	sampleRateHz uint32
@@ -44,6 +49,8 @@ type config struct {
 	lnaGain   GainStage
 	mixerGain GainStage
 	vgaGain   GainStage
+
+	autoGain bool
 
 	// IF filter overrides. The zero value of `*FilterSet` is "leave
 	// the chip at its init-seed value"; only the explicit Options
@@ -232,6 +239,26 @@ func WithFilterExt(enable bool) Option {
 	}
 }
 
+// WithAutoGain runs the auto-tune algorithm at Open time. The
+// algorithm pins Mixer and VGA at maximum, then walks the LNA
+// gain step downward until the chip's IF AGC signals it is no
+// longer severely over-gained (datasheet §8.1.5). Converges in
+// 1–3 iterations on most antenna chains.
+//
+// Layering: WithAutoGain takes precedence over any per-stage
+// option set earlier in the option list, since the search needs
+// a clean starting point. Per-stage options set *after*
+// WithAutoGain in the option list still apply (last-wins) and
+// disable auto-tune for those stages.
+func WithAutoGain() Option {
+	return func(c *config) {
+		c.autoGain = true
+		c.lnaGain = AutoGain
+		c.mixerGain = AutoGain
+		c.vgaGain = AutoGain
+	}
+}
+
 // WithDevice selects a receiver by zero-based enumeration index. The order
 // is the sysfs directory listing, which is stable per boot but not across
 // reboots — pin by serial number once the EEPROM reader lands.
@@ -295,11 +322,17 @@ type Receiver struct {
 // SignalStats reads the chip's AGC state on demand. Exposed
 // through the interface for the same reason as DroppedSampleChunks:
 // keeps callers free of platform-conditional code.
+//
+// AutoTuneGain runs the gain auto-tune algorithm against the
+// open device. Same rationale as the rest: per-platform
+// implementations supply the chip+tuner refs, callers see one
+// stable surface.
 type backend interface {
 	Read(ctx context.Context, p []byte) (int, error)
 	Close() error
 	DroppedSampleChunks() uint64
 	SignalStats() (SignalStats, error)
+	AutoTuneGain(ctx context.Context, opts AutoTuneOptions) (AutoTuneResult, error)
 }
 
 // Open enumerates RTL-SDR devices and opens the one at the configured
@@ -367,8 +400,27 @@ func (r *Receiver) DroppedSampleChunks() uint64 {
 func (r *Receiver) SignalStats() (SignalStats, error) {
 	stats, err := r.backend.SignalStats()
 	if err != nil {
-		return SignalStats{}, fmt.Errorf("sdr: signal stats: %w", err)
+		return SignalStats{}, fmt.Errorf("rtl2832u: signal stats: %w", err)
 	}
 
 	return stats, nil
+}
+
+// AutoTuneGain runs the gain auto-tune algorithm: pin Mixer and
+// VGA at maximum, walk the LNA gain step downward until the chip
+// stops signalling severe over-gain. Returns the converged
+// configuration and the IF AGC mean it observed there.
+//
+// Pass AutoTuneOptions{} for sensible defaults; override
+// individual fields for tighter or looser control. The call
+// blocks for as long as the algorithm runs (typically 1–3
+// seconds, max ~16 seconds if the LNA has to walk all the way to
+// zero).
+func (r *Receiver) AutoTuneGain(ctx context.Context, opts AutoTuneOptions) (AutoTuneResult, error) {
+	result, err := r.backend.AutoTuneGain(ctx, opts)
+	if err != nil {
+		return AutoTuneResult{}, fmt.Errorf("rtl2832u: auto-tune gain: %w", err)
+	}
+
+	return result, nil
 }
