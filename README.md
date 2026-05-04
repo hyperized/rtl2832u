@@ -170,10 +170,6 @@ GOOS=linux GOARCH=arm64 go build ./...
 
 `go test ./...` runs the offline test suite (controller mocks; no USB needed) on every supported platform. Integration tests that touch real hardware live behind a build tag and are not run by default; see `integration_linux_test.go`.
 
-## Used by
-
-- [`github.com/hyperized/demod1090`](https://github.com/hyperized/demod1090) — 1090 MHz Mode S / ADS-B demodulator. The motivating consumer; this driver was extracted from it.
-
 ## License
 
 Business Source License 1.1. See `LICENSE`. Free for non-commercial use; commercial integration requires a paid license. Converts to Apache-2.0 on the change date (2036-05-04).
