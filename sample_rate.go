@@ -54,8 +54,8 @@ const (
 // sentinels for SetSampleRate validation. Static so callers can
 // errors.Is and branch on the kind of failure.
 var (
-	ErrSampleRateOutOfRange = errors.New("sdr: sample rate out of supported range")
-	ErrSampleRateInGap      = errors.New("sdr: sample rate falls in the chip's unsupported gap")
+	ErrSampleRateOutOfRange = errors.New("rtl2832u: sample rate out of supported range")
+	ErrSampleRateInGap      = errors.New("rtl2832u: sample rate falls in the chip's unsupported gap")
 )
 
 // SetSampleRate programs the demodulator's resampler. The rate the
@@ -81,11 +81,11 @@ func (r *rtl2832u) SetSampleRate(rate, xtalHz uint32) (uint32, error) {
 	actualHz := computeActualSampleRate(rsampRatio, xtalHz)
 
 	if err := r.writeRSampRatio(rsampRatio); err != nil {
-		return 0, fmt.Errorf("sdr: write rsamp_ratio for %d Hz: %w", rate, err)
+		return 0, fmt.Errorf("rtl2832u: write rsamp_ratio for %d Hz: %w", rate, err)
 	}
 
 	if err := r.resetDemod(); err != nil {
-		return 0, fmt.Errorf("sdr: reset demod after sample rate change: %w", err)
+		return 0, fmt.Errorf("rtl2832u: reset demod after sample rate change: %w", err)
 	}
 
 	return actualHz, nil

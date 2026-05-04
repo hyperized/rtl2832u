@@ -15,7 +15,7 @@ import (
 // caller actually needs it; until then SetCenterFreq is a tuner-only
 // operation.
 var ErrNoTuner = errors.New(
-	"sdr: SetCenterFreq requires a Tuner; pass an R860 (or other) " +
+	"rtl2832u: SetCenterFreq requires a Tuner; pass an R860 (or other) " +
 		"tuner implementation when one becomes available, or use " +
 		"direct-sampling mode for sub-14 MHz reception once that lands",
 )
@@ -32,7 +32,7 @@ func (*rtl2832u) SetCenterFreq(rfHz uint32, tuner Tuner) error {
 	}
 
 	if err := tuner.SetFreq(rfHz); err != nil {
-		return fmt.Errorf("sdr: tuner %s set freq %d Hz: %w", tuner.Name(), rfHz, err)
+		return fmt.Errorf("rtl2832u: tuner %s set freq %d Hz: %w", tuner.Name(), rfHz, err)
 	}
 
 	return nil
