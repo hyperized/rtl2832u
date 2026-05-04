@@ -1,0 +1,38 @@
+name: dependabot-automerge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+# Dependabot PRs run with read-only GITHUB_TOKEN by default. We explicitly
+# elevate the workflow to write so the PR review + auto-merge calls succeed.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    name: approve and enable auto-merge
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]'
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+
+      # Restrict auto-merge to non-major bumps. Major upgrades may carry
+      # breaking changes worth a manual look; they still open as PRs but
+      # land via the regular protected-branch review flow.
+      - name: Approve PR
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: gh pr review --approve "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable GitHub auto-merge
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
