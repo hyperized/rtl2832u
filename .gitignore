@@ -1,0 +1,15 @@
+*.test
+*.out
+coverage.*
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/
+.claude/
+/Plan.MD
+/dist/
+# Vendor datasheets are referenced locally for development but are
+# not redistributable; keep them out of the repository.
+*.pdf
