@@ -67,9 +67,9 @@ func TestIntegrationOpenCloseAtADSB(t *testing.T) {
 //nolint:paralleltest // exclusive USB device access; cannot run in parallel with other integration tests.
 func TestIntegrationOpenCloseRoundTrip(t *testing.T) {
 	frequencies := []uint32{
-		88_500_000,              // FM broadcast band
-		137_100_000,             // NOAA / weather satellites
-		446_000_000,             // PMR446
+		88_500_000,                   // FM broadcast band
+		137_100_000,                  // NOAA / weather satellites
+		446_000_000,                  // PMR446
 		rtl2832u.DefaultCenterFreqHz, // ADS-B
 	}
 

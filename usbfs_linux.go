@@ -507,4 +507,3 @@ func (b *linuxBackend) SignalStats() (SignalStats, error) {
 func (b *linuxBackend) AutoTuneGain(ctx context.Context, opts AutoTuneOptions) (AutoTuneResult, error) {
 	return autoTuneGain(ctx, b.tuner, b, opts)
 }
-
