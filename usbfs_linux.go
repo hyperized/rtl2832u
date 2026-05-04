@@ -194,8 +194,8 @@ func selectDevice(cfg config, root string) (usbDevice, error) {
 		// "no dongle plugged in" case.
 		if errors.Is(err, fs.ErrNotExist) {
 			return usbDevice{}, fmt.Errorf(
-				"%w: sysfs %q missing (mount /sys, or run the container with --privileged)",
-				ErrNoDevice, root)
+				"%w: sysfs %q missing (mount /sys, or run the container with --privileged): %w",
+				ErrNoDevice, root, err)
 		}
 
 		return usbDevice{}, err
