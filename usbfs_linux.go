@@ -184,7 +184,7 @@ func runAutoTuneAtOpen(back *linuxBackend) error {
 		slog.Int("lna_step", int(result.LNA.Step)),
 		slog.Int("mixer_step", int(result.Mixer.Step)),
 		slog.Int("vga_step", int(result.VGA.Step)),
-		slog.Int("if_agc_mean", int(result.FinalIFAGC)),
+		slog.Int("if_agc_mean", result.FinalIFAGC),
 		slog.Int("iterations", result.Iterations),
 	)
 
