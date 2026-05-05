@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 )
 
 // ErrUnsupportedPlatform reports that this build target has no USB backend.
@@ -69,6 +70,15 @@ type config struct {
 	// PLL math (centre frequency) pick up the correction at
 	// Open time via effectiveXtalHz.
 	freqCorrectionPPM int32
+
+	// logger receives the package's diagnostic output (currently
+	// just the auto-tune converged-config line). Defaults to a
+	// discard logger so the package is silent unless the caller
+	// explicitly opts in via WithLogger. TUI consumers in
+	// particular should keep the default — stdlib `log` writes
+	// to stderr, which most TUI frameworks render onto the draw
+	// surface.
+	logger *slog.Logger
 }
 
 // biasTeeSetting holds an optional bias-tee override. The chip's
@@ -111,6 +121,25 @@ func defaultConfig() config {
 		lnaGain:      AutoGain,
 		mixerGain:    AutoGain,
 		vgaGain:      AutoGain,
+		logger:       slog.New(slog.DiscardHandler),
+	}
+}
+
+// WithLogger directs the package's diagnostic output (currently
+// the auto-tune converged-config line) to the given slog.Logger.
+// Pass nil to silence — the same as the default. Useful for
+// callers that want to tee the log into their structured-logging
+// pipeline, and essential for TUI consumers that would otherwise
+// have stdlib log output drawn over their UI.
+func WithLogger(logger *slog.Logger) Option {
+	return func(cfg *config) {
+		if logger == nil {
+			cfg.logger = slog.New(slog.DiscardHandler)
+
+			return
+		}
+
+		cfg.logger = logger
 	}
 }
 

@@ -3,6 +3,7 @@ package rtl2832u
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -62,6 +63,43 @@ func TestWithCenterFreq(t *testing.T) {
 
 	if cfg.centerFreqHz != 978_000_000 {
 		t.Fatalf("centerFreqHz = %d, want 978_000_000", cfg.centerFreqHz)
+	}
+}
+
+func TestWithLoggerStoresLogger(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+	if cfg.logger == nil {
+		t.Fatal("default logger is nil; want a discard logger")
+	}
+
+	custom := slog.New(slog.DiscardHandler)
+	WithLogger(custom)(&cfg)
+
+	if cfg.logger != custom {
+		t.Error("WithLogger did not install the supplied logger")
+	}
+}
+
+func TestWithLoggerNilFallsBackToDiscard(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultConfig()
+	custom := slog.New(slog.DiscardHandler)
+
+	// First install a custom logger, then pass nil — the nil
+	// path must replace the custom logger with a discard one
+	// rather than leave the custom one in place.
+	WithLogger(custom)(&cfg)
+	WithLogger(nil)(&cfg)
+
+	if cfg.logger == custom {
+		t.Error("WithLogger(nil) did not replace the custom logger")
+	}
+
+	if cfg.logger == nil {
+		t.Error("WithLogger(nil) left logger as nil; want a discard logger")
 	}
 }
 

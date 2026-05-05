@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -99,6 +99,12 @@ type linuxBackend struct {
 	// reach the same instance Open built.
 	tuner Tuner
 
+	// logger is the caller-supplied destination for diagnostic
+	// output (currently just the auto-tune converged-config
+	// line). Set from cfg.logger by openBackendWithSysfs;
+	// defaults to slog.DiscardHandler so the package is silent.
+	logger *slog.Logger
+
 	mu     sync.Mutex
 	closed bool
 
@@ -137,7 +143,7 @@ func openBackendWithSysfs(cfg config, root string) (backend, error) {
 		return nil, err
 	}
 
-	back := &linuxBackend{dev: device, iface: 0}
+	back := &linuxBackend{dev: device, iface: 0, logger: cfg.logger}
 	back.chip = newRTL2832U(back)
 
 	if err := configureChipAndTuner(cfg, usb, back); err != nil {
@@ -158,9 +164,10 @@ func openBackendWithSysfs(cfg config, root string) (backend, error) {
 }
 
 // runAutoTuneAtOpen executes the auto-tune algorithm during the
-// open flow and logs its converged configuration to stderr via
-// stdlib `log`. Extracted to keep openBackendWithSysfs's cyclomatic
-// complexity within revive's threshold.
+// open flow and emits the converged configuration via the
+// configured slog logger (default: discard). Extracted to keep
+// openBackendWithSysfs's cyclomatic complexity within revive's
+// threshold.
 //
 // Open does not currently take a context, so the auto-tune runs
 // against a background context — meaning the caller cannot
@@ -173,11 +180,12 @@ func runAutoTuneAtOpen(back *linuxBackend) error {
 		return fmt.Errorf("rtl2832u: auto-tune gain: %w", err)
 	}
 
-	log.Printf(
-		"rtl2832u: auto-tune converged: LNA=step%d Mixer=step%d VGA=step%d "+
-			"if_agc_mean=%d iterations=%d",
-		result.LNA.Step, result.Mixer.Step, result.VGA.Step,
-		result.FinalIFAGC, result.Iterations,
+	back.logger.Info("rtl2832u: auto-tune converged",
+		slog.Int("lna_step", int(result.LNA.Step)),
+		slog.Int("mixer_step", int(result.Mixer.Step)),
+		slog.Int("vga_step", int(result.VGA.Step)),
+		slog.Int("if_agc_mean", int(result.FinalIFAGC)),
+		slog.Int("iterations", result.Iterations),
 	)
 
 	return nil
