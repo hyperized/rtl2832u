@@ -138,26 +138,31 @@ const (
 // Both registers go to zero. They have separate named constants
 // (rather than reusing clearedByte) so the call sites name what
 // they're disabling, not just "write a zero here".
+//
+// Why both AGC subsystems are disabled
+// ------------------------------------
+// An earlier iteration of this driver wrote 0xc8 to regDemodAGCLoop
+// (en_if_agc + en_rf_agc + loop_gain2 = 4) so SignalStats had a
+// running RF/IF AGC loop to report. That made the chip drive the
+// IF_AGC pin while the R820T2's VGA was simultaneously reading
+// IF_AGC in its auto mode (VGA_MODE = 1). The two systems fed each
+// other's outputs into each other's inputs, the VGA gain wandered,
+// and the host-side decoder reported zero clean Mode S frames at
+// any tuner gain — a 15× yield drop compared to disabling the loop.
+//
+// librtlsdr writes 0 here for the R820T path; we now do the same.
+// SignalStats's RFAGCValue / IFAGCValue still read whatever the
+// chip's hardware leaves in the value registers, but the values are
+// effectively static and the AAGCLocked bit no longer flips during
+// an auto-tune sweep — a diagnostic regression we accept in
+// exchange for the chain actually decoding signal.
 const (
 	dagcDisabled uint8 = 0x00
 
-	// rfifAGCEnabled writes the demod-page-1-register-0x04 byte
-	// for the AGC subsystem per RTL2832U datasheet §8.1:
-	//
-	//   bit [7]   en_if_agc        = 1 (enable IF AGC loop)
-	//   bit [6]   en_rf_agc        = 1 (enable RF AGC loop)
-	//   bit [5]   aagc_hold        = 0 (loop runs, doesn't freeze)
-	//   bits[4:1] loop_gain2[3:0]  = 0100 (loop_gain2 = 4)
-	//   bit [0]   reserved          = 0
-	//
-	// The datasheet recommends loop_gain2 = 20 for stable lock but
-	// only the low 4 bits live in this byte; the 5th bit
-	// (loop_gain2[4]) is at page 1 register 0x05 bit 7 and has
-	// other neighbouring bits we'd rather not clobber without a
-	// read-modify-write. loop_gain2 = 4 is faster-locking and less
-	// stable than the datasheet's recommendation, but converges in
-	// the few-hundred-millisecond window SignalStats samples in.
-	rfifAGCEnabled uint8 = 0xc8
+	// rfifAGCDisabled writes the demod-page-1-register-0x04 byte
+	// for the AGC subsystem with both en_if_agc and en_rf_agc
+	// cleared. Mirrors librtlsdr's R820T configuration.
+	rfifAGCDisabled uint8 = 0x00
 )
 
 // --- PID filter phase values ---
@@ -317,7 +322,7 @@ func (r *rtl2832u) Init() error {
 		{"configure SDR mode", r.configureSDRMode},
 		{"init FSM state", r.initFSMState},
 		{"disable demod AGC", r.disableDemodAGC},
-		{"enable RF/IF AGC", r.enableRFIFAGC},
+		{"disable RF/IF AGC", r.disableRFIFAGC},
 		{"disable PID filter", r.disablePIDFilter},
 		{"configure ADC datapath", r.configureADCDatapath},
 		{"enable Zero-IF mode", r.enableZeroIF},
@@ -501,20 +506,21 @@ func (r *rtl2832u) disableDemodAGC() error {
 	return r.demodWriteByte(demodPage1, regDemodAGCEnable, dagcDisabled)
 }
 
-// enableRFIFAGC turns on the demod's RF and IF AGC loops. The IF
-// loop drives the IF_AGC pin to the R860's VGA so the chip's
-// closed-loop gain control reaches the tuner; the RF loop is a
-// no-op for tuner gain on R820T-family dongles (the R860 owns its
-// own LNA/Mixer AGC) but its readback register if_agc_val /
-// rf_agc_val is what SignalStats consumes for diagnostics and the
-// auto-tune metric.
+// disableRFIFAGC turns OFF the demod's RF and IF AGC loops. With
+// the R820T2 attached the loops do more harm than good: the IF
+// loop drives the chip's IF_AGC pin while the R820T2's VGA in
+// auto mode reads it. Both ends try to converge against each
+// other and the VGA gain wanders — host-side decoder yield
+// collapses to ~zero clean Mode S frames. librtlsdr disables both
+// loops on the R820T path; we mirror that.
 //
-// Both bits default to enabled per RTL2832U datasheet §8.1
-// register table; an earlier iteration disabled them both,
-// matching librtlsdr's choice but starving SignalStats. We keep
-// them on.
-func (r *rtl2832u) enableRFIFAGC() error {
-	return r.demodWriteByte(demodPage1, regDemodAGCLoop, rfifAGCEnabled)
+// SignalStats consequence: with the loops off the chip's
+// if_agc_val / rf_agc_val registers stop tracking a live AGC
+// loop, and the AAGCLocked flag rarely flips. Diagnostics that
+// rely on those values become uninformative; the upside is the
+// radio actually decodes signal.
+func (r *rtl2832u) disableRFIFAGC() error {
+	return r.demodWriteByte(demodPage1, regDemodAGCLoop, rfifAGCDisabled)
 }
 
 // disablePIDFilter sets PID filter off (enable_PID = 0). PID

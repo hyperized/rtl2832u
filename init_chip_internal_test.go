@@ -211,8 +211,8 @@ var initPhaseCases = func() []initPhaseCase {
 		{"disableDemodAGC", (*rtl2832u).disableDemodAGC, []capturedCall{
 			wantWrite(encodeDemodAddr(0x11), pg1, 0x00),
 		}},
-		{"enableRFIFAGC", (*rtl2832u).enableRFIFAGC, []capturedCall{
-			wantWrite(encodeDemodAddr(0x04), pg1, 0xc8),
+		{"disableRFIFAGC", (*rtl2832u).disableRFIFAGC, []capturedCall{
+			wantWrite(encodeDemodAddr(0x04), pg1, 0x00),
 		}},
 		{"disablePIDFilter", (*rtl2832u).disablePIDFilter, []capturedCall{
 			wantWrite(encodeDemodAddr(0x61), pg0, 0x60),
