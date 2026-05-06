@@ -170,6 +170,19 @@ GOOS=linux GOARCH=arm64 go build ./...
 
 `go test ./...` runs the offline test suite (controller mocks; no USB needed) on every supported platform. Integration tests that touch real hardware live behind a build tag and are not run by default; see `integration_linux_test.go`.
 
+## Roadmap
+
+- **Push tuner-specific demod config behind the `Tuner` interface.**
+  Today `chip.Init()` opinionatedly enables Zero-IF; `configureForR820T`
+  walks that opinion back when an R820T2 is the actual front end. The
+  next tuner (R828D, future Rafael parts) would need a sibling override
+  doing the same dance. Cleaner shape: `Init()` becomes neutral, the
+  `Tuner` interface gains `IFFreqHz() uint32` and `OutputsRealIF() bool`,
+  and a single `chip.ConfigureForTuner(t, xtalHz)` reads the tuner's
+  requirements and writes the matching demod registers. Worth doing
+  before adding any second tuner; not urgent today since R820T2 is the
+  only hardware target that ships.
+
 ## License
 
 Business Source License 1.1. See `LICENSE`. Free for non-commercial use; commercial integration requires a paid license. Converts to Apache-2.0 on the change date (2036-05-04).

@@ -273,6 +273,15 @@ func configureChipAndTuner(cfg config, usb usbDevice, back *linuxBackend) error 
 
 	back.tuner = tuner
 
+	// The R820T2 outputs a real-valued 3.57 MHz IF, not zero-IF.
+	// Reconfigure the demod's DDC + spectrum-inversion + ADC-input
+	// routing accordingly before tuning the centre frequency. Skipping
+	// this leaves Init()'s zero-IF defaults in place, which routes the
+	// tuner's I-only output around the DDC and starves the Q channel.
+	if err := chip.configureForR820T(xtalHz); err != nil {
+		return fmt.Errorf("sdr: configure demod for R820T tuner: %w", err)
+	}
+
 	if err := chip.SetCenterFreq(cfg.centerFreqHz, tuner); err != nil {
 		return fmt.Errorf(
 			"sdr: configure centre frequency to %d Hz: %w "+

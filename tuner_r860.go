@@ -238,13 +238,23 @@ func (t *R860) detect() error {
 	})
 }
 
-// init writes the seed register table in a single I2C transaction.
-// The R860's I2C engine auto-increments its register pointer, so
-// one (reg-address, byte0..byteN) payload programs the entire
-// 0x05..0x1f range at once.
+// init writes the seed register table and then runs the post-seed
+// configuration librtlsdr applies via r82xx_set_tv_standard +
+// r82xx_sysfreq_sel. The seed table alone leaves loop-through
+// enabled (R0x05 bit [7] = 1), which routes IF energy to a tuner
+// pin instead of the internal baseband — observable as a dead Q
+// channel at the host's IQ stream. applyPostInit clears the bit
+// and programs the rest of the SDR-mode operating state.
+//
+// One I2C bridge bracket covers both phases so the chip's
+// repeater opens once per init rather than twice.
 func (t *R860) init() error {
 	return t.withRepeater(func() error {
-		return t.writeRegisters(r860InitBaseReg, r860InitValues[:])
+		if err := t.writeRegisters(r860InitBaseReg, r860InitValues[:]); err != nil {
+			return err
+		}
+
+		return t.applyPostInit()
 	})
 }
 
