@@ -1,5 +1,8 @@
+/rtl-probe
+/rtl-probe-*
 *.test
 *.out
+*.iq
 coverage.*
 .env
 .env.*
