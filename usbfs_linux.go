@@ -105,8 +105,11 @@ type linuxBackend struct {
 	// defaults to slog.DiscardHandler so the package is silent.
 	logger *slog.Logger
 
+	// mu serialises Close's idempotency check. closed is a separate
+	// atomic so the URB reaper's hot path can sample it without
+	// trapping into the mutex on every completion.
 	mu     sync.Mutex
-	closed bool
+	closed atomic.Bool
 
 	streamOnce sync.Once
 	streamErr  error
@@ -115,8 +118,6 @@ type linuxBackend struct {
 
 	urbs    []usbdevfsURB
 	urbBufs [][]byte
-
-	readTail []byte
 
 	droppedURBs atomic.Uint64
 }
@@ -262,8 +263,23 @@ func configureChipAndTuner(cfg config, usb usbDevice, back *linuxBackend) error 
 
 	xtalHz := effectiveXtalHz(referenceClockHz, cfg.freqCorrectionPPM)
 
-	if _, err := chip.SetSampleRate(cfg.sampleRateHz, xtalHz); err != nil {
-		return fmt.Errorf("sdr: configure sample rate: %w", err)
+	// Order matches librtlsdr's rtlsdr_open + first-time
+	// set_sample_rate / set_center_freq:
+	//
+	//   1. Init (generic baseband)
+	//   2. R820T-specific demod writes (ZeroIF off, I-only ADC,
+	//      IF freq, spectrum inversion) — must precede tuner init
+	//      so the chip's ADC routing is right when the tuner
+	//      configures itself.
+	//   3. Tuner init (seed table + r82xx_set_tv_standard +
+	//      r82xx_sysfreq_sel).
+	//   4. set_bandwidth (IF filter shape for sample rate) +
+	//      write resampler ratio + soft-reset pulse.
+	//   5. set_center_freq.
+	//   6. Gain / IF filter overrides / bias-tee.
+	//   7. Reset sample buffer.
+	if err := chip.configureForR820T(xtalHz); err != nil {
+		return fmt.Errorf("sdr: configure demod for R820T tuner: %w", err)
 	}
 
 	tuner, err := NewR860(chip, xtalHz)
@@ -273,13 +289,30 @@ func configureChipAndTuner(cfg config, usb usbDevice, back *linuxBackend) error 
 
 	back.tuner = tuner
 
-	// The R820T2 outputs a real-valued 3.57 MHz IF, not zero-IF.
-	// Reconfigure the demod's DDC + spectrum-inversion + ADC-input
-	// routing accordingly before tuning the centre frequency. Skipping
-	// this leaves Init()'s zero-IF defaults in place, which routes the
-	// tuner's I-only output around the DDC and starves the Q channel.
-	if err := chip.configureForR820T(xtalHz); err != nil {
-		return fmt.Errorf("sdr: configure demod for R820T tuner: %w", err)
+	// librtlsdr's rtlsdr_set_sample_rate runs r82xx_set_bandwidth
+	// before writing the resampler ratio. The bandwidth call programs
+	// R0x0a / R0x0b — the IF filter shape — and chooses the IF
+	// centre frequency the tuner will produce. We then have to
+	// reprogram both the demod's DDC frequency (so it mixes that
+	// same IF down to baseband) and the tuner's intFreqHz field
+	// (so SetCenterFreq offsets the LO by it). Without those two
+	// the filter sits at its seed values, the demod still expects
+	// the chip-init 3.57 MHz IF, and the LO targets the wrong
+	// frequency — every CRC fails. InitializeForSampleRate brackets
+	// the I²C repeater itself; we propagate its returned IF to the
+	// demod here.
+	tunerIntFreqHz, err := tuner.InitializeForSampleRate(cfg.sampleRateHz)
+	if err != nil {
+		return fmt.Errorf("sdr: configure tuner IF filter for sample rate: %w", err)
+	}
+
+	if err := chip.SetIFFrequency(tunerIntFreqHz, xtalHz); err != nil {
+		return fmt.Errorf("sdr: align demod DDC with tuner IF (%d Hz): %w",
+			tunerIntFreqHz, err)
+	}
+
+	if _, err := chip.SetSampleRate(cfg.sampleRateHz, xtalHz); err != nil {
+		return fmt.Errorf("sdr: configure sample rate: %w", err)
 	}
 
 	if err := chip.SetCenterFreq(cfg.centerFreqHz, tuner); err != nil {
@@ -417,10 +450,18 @@ func releaseInterface(dev *os.File, iface uint32) error {
 	return nil
 }
 
-// Read fills dst with interleaved unsigned 8-bit IQ samples and
-// returns the number of bytes written. The first call lazily
-// starts the stream goroutine; subsequent calls drain the same
-// channel. Honours ctx.Err() so callers can interrupt long Reads.
+// Read returns up to len(dst) bytes from the next completed URB.
+// It blocks until a chunk arrives, the stream ends, or ctx is
+// cancelled. A single Read maps to a single URB completion:
+// callers needing fill-to-buffer semantics across multiple URBs
+// wrap with io.ReadFull.
+//
+// One-URB-per-Read is the simpler contract: it eliminates a
+// per-backend "tail" buffer that was mutated without a lock,
+// which silently corrupted state under any accidental concurrent
+// Reader. The single-producer contract still applies — usbfs
+// bulk endpoints serialise transfers — but the new shape is also
+// safe under misuse: each Read either gets a chunk or doesn't.
 func (b *linuxBackend) Read(ctx context.Context, dst []byte) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, fmt.Errorf("sdr: read cancelled: %w", err)
@@ -430,37 +471,18 @@ func (b *linuxBackend) Read(ctx context.Context, dst []byte) (int, error) {
 		return 0, err
 	}
 
-	count := 0
-
-	// Drain the leftover from a previous Read first; we only put
-	// bytes here when a chunk was larger than the caller's buffer.
-	if len(b.readTail) > 0 {
-		copied := copy(dst, b.readTail)
-		b.readTail = b.readTail[copied:]
-		count += copied
-	}
-
-	for count < len(dst) {
-		select {
-		case chunk, ok := <-b.streamCh:
-			if !ok {
-				return count, b.streamErr
-			}
-
-			copied := copy(dst[count:], chunk)
-			count += copied
-
-			if copied < len(chunk) {
-				b.readTail = chunk[copied:]
-			}
-		case <-ctx.Done():
-			return count, fmt.Errorf("sdr: read cancelled: %w", ctx.Err())
-		case <-b.streamDone:
-			return count, b.streamErr
+	select {
+	case chunk, ok := <-b.streamCh:
+		if !ok {
+			return 0, b.streamErr
 		}
-	}
 
-	return count, nil
+		return copy(dst, chunk), nil
+	case <-ctx.Done():
+		return 0, fmt.Errorf("sdr: read cancelled: %w", ctx.Err())
+	case <-b.streamDone:
+		return 0, b.streamErr
+	}
 }
 
 // Close releases the USB interface and closes the file descriptor.
@@ -474,14 +496,16 @@ func (b *linuxBackend) Read(ctx context.Context, dst []byte) (int, error) {
 // device is physically unplugged, which would block subsequent
 // demod1090 invocations.
 func (b *linuxBackend) Close() error {
+	// mu serialises the "first-Close wins" check; the atomic store
+	// publishes the closed state to the reaper's lock-free read.
 	b.mu.Lock()
-	if b.closed {
+	if b.closed.Load() {
 		b.mu.Unlock()
 
 		return nil
 	}
 
-	b.closed = true
+	b.closed.Store(true)
 	b.mu.Unlock()
 
 	if b.streamDone != nil {
@@ -490,6 +514,17 @@ func (b *linuxBackend) Close() error {
 		}
 
 		<-b.streamDone
+
+		// If runStreamReaper exited early (e.g. on a non-zero URB
+		// status from the kernel) some URBs may still be queued
+		// without anyone to reap them. The kernel keeps the device
+		// fd pinned until every URB it knows about has been reaped,
+		// so we drain non-blockingly here. Cap at the ring size: a
+		// real URB can only complete once, and the reaper already
+		// consumed whatever it could before exiting. drainNextURB
+		// returns (false, nil) when the kernel has nothing more to
+		// hand back.
+		b.drainOrphanedURBs()
 	}
 
 	var firstErr error
@@ -502,6 +537,31 @@ func (b *linuxBackend) Close() error {
 	}
 
 	return firstErr
+}
+
+// drainOrphanedURBs reaps any URBs the kernel still holds after the
+// stream goroutine has exited. Bounded by the ring size so a
+// runaway kernel state cannot stall Close indefinitely; any reap
+// error is logged at warn level and ignored — the goal is best-
+// effort cleanup before we release the interface and close the fd.
+// Warn (not Debug) because a reap error here indicates the kernel
+// is in an unexpected state and is the kind of signal a user
+// looking at logs after a "device wedged on Close" report will
+// want to see without flipping verbosity.
+func (b *linuxBackend) drainOrphanedURBs() {
+	for range b.urbs {
+		hasURB, err := b.drainNextURB()
+		if err != nil {
+			b.logger.Warn("rtl2832u: drain orphaned URB",
+				slog.String("error", err.Error()))
+
+			return
+		}
+
+		if !hasURB {
+			return
+		}
+	}
 }
 
 // DroppedSampleChunks satisfies the backend interface; see the

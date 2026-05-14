@@ -181,6 +181,17 @@ type R860 struct {
 	i2c    i2cTransport
 	xtalHz uint32
 	shadow [r860RegCount]uint8
+
+	// intFreqHz is the IF frequency the chip's down-converter
+	// expects on the analogue side — i.e. what the tuner's mixer
+	// must offset its LO by. Updated by SetBandwidthForSampleRate
+	// (the librtlsdr-equivalent path); read by SetFreq when
+	// computing lo_freq = rfHz + intFreqHz. The seed value
+	// (3.57 MHz) matches both the chip's default DDC programming
+	// in configureForR820T and r82xx_set_tv_standard's if_khz
+	// = 3570 default, so a SetFreq before any bandwidth call
+	// still produces a coherent chain.
+	intFreqHz uint32
 }
 
 // NewR860 detects an R820T/R860 on the chip's I2C bus and writes
@@ -195,7 +206,11 @@ type R860 struct {
 // step so callers cannot end up holding a half-initialised tuner;
 // any error rolls the whole operation back.
 func NewR860(transport i2cTransport, xtalHz uint32) (*R860, error) {
-	tuner := &R860{i2c: transport, xtalHz: xtalHz}
+	tuner := &R860{
+		i2c:       transport,
+		xtalHz:    xtalHz,
+		intFreqHz: r820tIFFreqHz, // matches configureForR820T's DDC default
+	}
 
 	if err := tuner.detect(); err != nil {
 		return nil, err

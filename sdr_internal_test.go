@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -126,12 +127,13 @@ func TestWithFrequencyCorrectionClampsHighAndLow(t *testing.T) {
 	t.Parallel()
 
 	for _, testCase := range []struct {
-		name string
-		in   int
-		want int32
+		name        string
+		in          int
+		want        int32
+		wantWarning bool
 	}{
-		{name: "above_max_clamps_to_max", in: 5_000, want: FrequencyCorrectionPPMMax},
-		{name: "below_min_clamps_to_min", in: -5_000, want: -FrequencyCorrectionPPMMax},
+		{name: "above_max_clamps_to_max", in: 5_000, want: FrequencyCorrectionPPMMax, wantWarning: true},
+		{name: "below_min_clamps_to_min", in: -5_000, want: -FrequencyCorrectionPPMMax, wantWarning: true},
 		{name: "exact_max_passes_through", in: FrequencyCorrectionPPMMax, want: FrequencyCorrectionPPMMax},
 		{name: "exact_min_passes_through", in: -FrequencyCorrectionPPMMax, want: -FrequencyCorrectionPPMMax},
 	} {
@@ -144,6 +146,12 @@ func TestWithFrequencyCorrectionClampsHighAndLow(t *testing.T) {
 			if cfg.freqCorrectionPPM != testCase.want {
 				t.Errorf("WithFrequencyCorrection(%d) → %d, want %d",
 					testCase.in, cfg.freqCorrectionPPM, testCase.want)
+			}
+
+			gotWarning := len(cfg.warnings) > 0
+			if gotWarning != testCase.wantWarning {
+				t.Errorf("warnings present = %v, want %v (warnings=%#v)",
+					gotWarning, testCase.wantWarning, cfg.warnings)
 			}
 		})
 	}
@@ -279,6 +287,108 @@ func TestPerStageOptionsOverrideWithGain(t *testing.T) {
 	// +20.0 dB is centi-dB 2000; vgaStepForCentiDB((2000) - (-1200)) / 350 = 9.
 	if cfg.vgaGain.Auto || cfg.vgaGain.Step != 9 {
 		t.Errorf("VGA = %+v, want manual step 9 (~+19.5 dB)", cfg.vgaGain)
+	}
+}
+
+func TestGainStepMaxMatchesTunerConstant(t *testing.T) {
+	t.Parallel()
+
+	// Guards against the option-layer and tuner-layer constants
+	// drifting apart. r860GainStepCount is 16 (cardinality);
+	// gainStepMax is 15 (highest valid step). One must always be
+	// the other minus one.
+	if want := r860GainStepCount - 1; gainStepMax != want {
+		t.Fatalf("gainStepMax = %d, want r860GainStepCount-1 = %d", gainStepMax, want)
+	}
+}
+
+func TestWithManualGainOptions(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name        string
+		apply       func(cfg *config, step uint8)
+		read        func(cfg *config) GainStage
+		stageLabel  string
+		in          uint8
+		wantStep    uint8
+		wantWarning bool
+	}{
+		{
+			name:       "lna_in_range",
+			apply:      func(c *config, s uint8) { WithManualLNAGain(s)(c) },
+			read:       func(c *config) GainStage { return c.lnaGain },
+			stageLabel: "LNA",
+			in:         7,
+			wantStep:   7,
+		},
+		{
+			name:        "lna_clamped",
+			apply:       func(c *config, s uint8) { WithManualLNAGain(s)(c) },
+			read:        func(c *config) GainStage { return c.lnaGain },
+			stageLabel:  "LNA",
+			in:          200,
+			wantStep:    gainStepMax,
+			wantWarning: true,
+		},
+		{
+			name:       "mixer_in_range",
+			apply:      func(c *config, s uint8) { WithManualMixerGain(s)(c) },
+			read:       func(c *config) GainStage { return c.mixerGain },
+			stageLabel: "Mixer",
+			in:         0,
+			wantStep:   0,
+		},
+		{
+			name:        "mixer_clamped",
+			apply:       func(c *config, s uint8) { WithManualMixerGain(s)(c) },
+			read:        func(c *config) GainStage { return c.mixerGain },
+			stageLabel:  "Mixer",
+			in:          16,
+			wantStep:    gainStepMax,
+			wantWarning: true,
+		},
+		{
+			name:       "vga_in_range",
+			apply:      func(c *config, s uint8) { WithManualVGAGain(s)(c) },
+			read:       func(c *config) GainStage { return c.vgaGain },
+			stageLabel: "VGA",
+			in:         gainStepMax,
+			wantStep:   gainStepMax,
+		},
+		{
+			name:        "vga_clamped",
+			apply:       func(c *config, s uint8) { WithManualVGAGain(s)(c) },
+			read:        func(c *config) GainStage { return c.vgaGain },
+			stageLabel:  "VGA",
+			in:          99,
+			wantStep:    gainStepMax,
+			wantWarning: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := defaultConfig()
+			testCase.apply(&cfg, testCase.in)
+
+			got := testCase.read(&cfg)
+			if got.Auto || got.Step != testCase.wantStep {
+				t.Errorf("%s gain = %+v, want manual step %d",
+					testCase.stageLabel, got, testCase.wantStep)
+			}
+
+			gotWarning := len(cfg.warnings) > 0
+			if gotWarning != testCase.wantWarning {
+				t.Errorf("warnings present = %v, want %v (warnings=%#v)",
+					gotWarning, testCase.wantWarning, cfg.warnings)
+			}
+
+			if testCase.wantWarning && !strings.Contains(cfg.warnings[0], testCase.stageLabel) {
+				t.Errorf("warning %q missing stage label %q",
+					cfg.warnings[0], testCase.stageLabel)
+			}
+		})
 	}
 }
 

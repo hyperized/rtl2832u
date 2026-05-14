@@ -194,7 +194,12 @@ func TestSetVGAGainManualRejectsOutOfRange(t *testing.T) {
 	}
 }
 
-func TestSetVGAGainAutoSetsModeBit(t *testing.T) {
+// TestSetVGAGainAutoMatchesLibrtlsdr verifies the AGC branch
+// writes 0x0b in mask 0x9f — the exact pattern librtlsdr's
+// r82xx_set_gain emits for "auto" gain mode. Bit 4 cleared puts
+// the VGA on its register-driven gain path; the 0x0b code is the
+// mid-band entry point the LNA+Mixer AGC loops ride above.
+func TestSetVGAGainAutoMatchesLibrtlsdr(t *testing.T) {
 	t.Parallel()
 
 	tuner, bus := gainTunerOnFakeBus(t)
@@ -210,7 +215,12 @@ func TestSetVGAGainAutoSetsModeBit(t *testing.T) {
 		t.Fatalf("setVGAGainAuto: %v", err)
 	}
 
-	expectMaskedWrite(t, bus, regR860VGAGain, maskR860VGAMode, maskR860VGAMode, prior)
+	const (
+		wantVal  uint8 = 0x0b
+		wantMask uint8 = 0x9f
+	)
+
+	expectMaskedWrite(t, bus, regR860VGAGain, wantVal, wantMask, prior)
 }
 
 func TestSetGainHelpersWrapBusErrors(t *testing.T) {

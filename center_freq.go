@@ -20,9 +20,10 @@ var ErrNoTuner = errors.New(
 		"direct-sampling mode for sub-14 MHz reception once that lands",
 )
 
-// SetCenterFreq retunes the receiver to hz. With Init having
-// configured Zero-IF mode, the chip's IF stays at zero and the
-// tuner does all the mixing — we just delegate.
+// SetCenterFreq retunes the receiver to rfHz. With configureForR820T
+// having put the chip in real-IF mode at intFreqHz, the tuner's
+// SetFreq is responsible for both LO programming and offsetting by
+// intFreqHz — we just delegate.
 //
 // Errors from the tuner are wrapped with the tuner's Name() so
 // downstream messages identify the silicon, not just "tuner failed".

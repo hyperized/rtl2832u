@@ -118,6 +118,23 @@ func (r *rtl2832u) configureForR820T(xtalHz uint32) error {
 	return nil
 }
 
+// SetIFFrequency reprograms the demod's DDC to mix the given IF
+// down to baseband. Call this whenever the tuner's IF output
+// changes (i.e. after r82xx_set_bandwidth picks a different
+// intFreq for a different sample rate); leaving the demod at the
+// init-time 3.57 MHz value while the tuner produces a 1.815 MHz IF
+// (the default-branch result for samp_rate ≤ 2.43 MHz) shifts the
+// signal by 1.755 MHz at the demod's input — past the decimating
+// FIR's pass-band edge for any output ≤ 3.5 MS/s, attenuating the
+// Mode S envelope into the noise floor.
+//
+// Thin wrapper around writeDemodIFFreq exposed for the bring-up
+// orchestrator; the package's own bring-up uses the unexported
+// helper directly.
+func (r *rtl2832u) SetIFFrequency(freqHz, xtalHz uint32) error {
+	return r.writeDemodIFFreq(freqHz, xtalHz)
+}
+
 // writeDemodIFFreq programs the DDC's digital IF frequency in
 // the chip's signed 22-bit two's-complement format. The mix-down
 // uses the negation: register encodes -freqHz × 2²² / xtalHz so

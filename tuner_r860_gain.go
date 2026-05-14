@@ -154,11 +154,31 @@ func (t *R860) setVGAGainManual(step uint8) error {
 	return nil
 }
 
-// setVGAGainAuto hands the VGA back to the IF_AGC pin (the
-// RTL2832U's DAGC drives it, exactly as librtlsdr leaves it by
-// default).
+// setVGAGainAuto matches librtlsdr's r82xx_set_gain auto branch:
+// clears bit 4 of R12 (so VGA_CODE drives the gain — *not* the
+// IF_AGC pin) and pins VGA_CODE to 0x0b. The IF_AGC pin path
+// looks attractive on paper but only works when the demod's
+// RF/IF AGC loop is on; rtl2832u disables that loop on R820T
+// silicon (it fights the tuner's own LNA/Mixer AGC), so an
+// IF_AGC-driven VGA collapses to ~0 dB and the chip outputs
+// near-zero IQ amplitude. The 0x0b code is librtlsdr's empirical
+// "AGC entry point" — a mid-band fixed gain that LNA and Mixer
+// AGC ride above.
 func (t *R860) setVGAGainAuto() error {
-	if err := t.writeRegisterMasked(regR860VGAGain, maskR860VGAMode, maskR860VGAMode); err != nil {
+	const (
+		// vgaAGCCode is the VGA_CODE value librtlsdr leaves in
+		// place when the LNA+Mixer AGC loops drive the chain.
+		// 0x0b ≈ 12.4 dB on the R860's VGA curve (datasheet
+		// Table 5-3 row 11).
+		vgaAGCCode uint8 = 0x0b
+
+		// vgaAGCMask covers VGA_MODE (bit 4) and VGA_CODE (bits
+		// 3..0) plus bit 7 (reserved/zero). 0x9f mirrors
+		// librtlsdr's r82xx_set_gain mask exactly.
+		vgaAGCMask uint8 = 0x9f
+	)
+
+	if err := t.writeRegisterMasked(regR860VGAGain, vgaAGCCode, vgaAGCMask); err != nil {
 		return fmt.Errorf("r860: set VGA auto gain: %w", err)
 	}
 

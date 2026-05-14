@@ -72,24 +72,29 @@ const (
 	// register 0x04 by right-shifting after masking.
 	r860FineTuneShift uint8 = 4
 
-	// sdmByteShift / sdmByteMask split the 16-bit SDM into two 8-bit
+	// sdmByteShift / sdmLowMask split the 16-bit SDM into two 8-bit
 	// register writes.
 	sdmByteShift uint8  = 8
-	sdmHighShift        = sdmByteShift
 	sdmLowMask   uint16 = 0xff
 )
 
 // SetFreq implements Tuner. setMux configures the analogue front
 // end for the requested band; the PLL synthesis path then drives
-// the LO. Both stages share one withRepeater bracket so the chip's
-// I2C bridge opens once per call.
+// the LO at rfHz + intFreqHz so the tuner's mixer outputs at
+// intFreqHz IF (the chip's DDC mixes that to baseband). librtlsdr
+// computes lo_freq = freq + priv->int_freq for the same reason —
+// matching the R820T2's analogue IF-filter centre with where the
+// signal actually lands. Both stages share one withRepeater
+// bracket so the chip's I²C bridge opens once per call.
 func (t *R860) SetFreq(rfHz uint32) error {
+	loHz := rfHz + t.intFreqHz
+
 	return t.withRepeater(func() error {
-		if err := t.setMux(rfHz); err != nil {
+		if err := t.setMux(loHz); err != nil {
 			return err
 		}
 
-		return t.setFreqInner(rfHz)
+		return t.setFreqInner(loHz)
 	})
 }
 
@@ -155,7 +160,7 @@ func (t *R860) setFreqInner(rfHz uint32) error {
 	// SDM splits across two byte writes. The shift and mask reduce
 	// the 16-bit SDM to byte-sized values; gosec G115 cannot see
 	// the bound but the math is exact.
-	sdmHigh := uint8(settings.sdm >> sdmHighShift) //nolint:gosec
+	sdmHigh := uint8(settings.sdm >> sdmByteShift) //nolint:gosec
 	sdmLow := uint8(settings.sdm & sdmLowMask)     //nolint:gosec
 
 	if err := t.writeRegister(regR860SDMHigh, sdmHigh); err != nil {

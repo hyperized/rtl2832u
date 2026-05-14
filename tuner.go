@@ -13,11 +13,13 @@ type Tuner interface {
 	// "R860", "E4000". Used in log lines and error messages.
 	Name() string
 
-	// SetFreq retunes to the given centre frequency in Hz. The chip's
-	// IF is normally Zero-IF (en_bbin=1 from Init), so the tuner is
-	// programmed to mix the requested RF down to baseband. Range
-	// and step depend on the implementation; most R820T-family
-	// tuners cover roughly 24 MHz to 1.766 GHz.
+	// SetFreq retunes to the given centre frequency in Hz. For
+	// real-IF tuners (R820T2 / R860) the implementation offsets
+	// its LO by the IF set during InitializeForSampleRate so the
+	// chip's DDC sees the signal at the agreed IF; zero-IF tuners
+	// would mix straight to baseband. Range and step depend on
+	// the implementation; most R820T-family tuners cover roughly
+	// 24 MHz to 1.766 GHz.
 	SetFreq(hz uint32) error
 
 	// SetLNAGain, SetMixerGain, and SetVGAGain configure the tuner's
@@ -49,6 +51,19 @@ type Tuner interface {
 	// documented in the public datasheet; empirically toggling this
 	// on a marginal chain may help.
 	SetFilterExt(enable bool) error
+
+	// InitializeForSampleRate configures tuner-specific IF/bandwidth
+	// for the given sample rate and returns the intermediate
+	// frequency the demod should be programmed to. The orchestrator
+	// calls it once during Open, after the tuner's own constructor
+	// (NewR860) and before any of (*rtl2832u).SetIFFrequency,
+	// SetSampleRate, or SetCenterFreq, so the demod's DDC can be
+	// aligned with the tuner's IF before the resampler arms and
+	// before the LO is set against an offset that depends on the IF.
+	//
+	// Implementations open the chip's I²C repeater internally — the
+	// orchestrator must not bracket the call with withRepeater.
+	InitializeForSampleRate(rateHz uint32) (intFreqHz uint32, err error)
 }
 
 // GainStage describes how one tuner gain stage operates.

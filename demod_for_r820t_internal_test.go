@@ -107,3 +107,39 @@ func TestWriteDemodIFFreqRoundsToTwosComplement(t *testing.T) {
 		t.Errorf("reassembled IF-freq encoding = %#x, want %#x", got22, wantEncoded)
 	}
 }
+
+// TestSetIFFrequencyDelegatesToWriter pins the exported wrapper to
+// the same three-byte demod-page-1 write sequence that
+// writeDemodIFFreq emits. The unexported helper is already covered;
+// this test exists purely to keep the exported entry point from
+// silently diverging (e.g. if a future refactor wires the wrapper
+// to a different writer by accident).
+func TestSetIFFrequencyDelegatesToWriter(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockController{inDefault: flushReadOK}
+	chip := &rtl2832u{ctrl: mock}
+
+	if err := chip.SetIFFrequency(r820tIFFreqHz, 28_800_000); err != nil {
+		t.Fatalf("SetIFFrequency: %v", err)
+	}
+
+	writes := writesOnly(mock.calls)
+
+	if len(writes) != 3 {
+		t.Fatalf("got %d writes, want 3 (hi/mid/lo)", len(writes))
+	}
+
+	// Reassembled 22-bit value must match the encoded -3.57 MHz —
+	// same invariant TestWriteDemodIFFreqRoundsToTwosComplement
+	// pins on the unexported path.
+	got22 := uint32(writes[0].data[0])<<16 |
+		uint32(writes[1].data[0])<<8 |
+		uint32(writes[2].data[0])
+	got22 &= ifFreqRegMask
+
+	const wantEncoded uint32 = 0x381112
+	if got22 != wantEncoded {
+		t.Errorf("SetIFFrequency encoding = %#x, want %#x (delegation regressed)", got22, wantEncoded)
+	}
+}

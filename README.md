@@ -16,13 +16,15 @@ Hardware-validated end-to-end on a Realtek RTL2838 + R820T2 dongle on a Raspberr
 
 ```
 sysfs enumerate → claim usbfs interface → RTL2832U baseband init →
-sample-rate divider → R860 detect (chip-ID 0x96 per datasheet §6) →
-seed register table over I²C → PLL lock → per-stage gain →
-IF channel-filter → optional bias-tee → optional auto-gain search →
-URB-ring bulk read → IQ samples on the wire
+configure demod for R820T real-IF (I-only ADC, spectrum inversion) →
+R860 detect (chip-ID 0x96 per datasheet §6) → seed register table over I²C →
+rate-driven IF filter (Tuner.InitializeForSampleRate) →
+align demod DDC with tuner IF → sample-rate divider → PLL lock →
+per-stage gain → IF channel-filter overrides → optional bias-tee →
+optional auto-gain search → URB-ring bulk read → IQ samples on the wire
 ```
 
-Coverage: 99.7 % of statements (`make cover`); lint clean against `golangci-lint v2.12` with `default: all` and `revive` enable-all-rules at line-length 120.
+Coverage: ≥ 98 % of statements across the library and the `rtl-probe` operator tool (`make cover`); lint clean against `golangci-lint v2.12` with `default: all` and `revive` enable-all-rules at line-length 120.
 
 ## Quickstart
 
@@ -68,7 +70,7 @@ The driver exposes a single `Receiver` opened through `Open` with functional opt
 | | |
 |---|---|
 | `Open(opts ...Option) (*Receiver, error)` | Enumerates dongles via sysfs, claims interface 0, runs the chip + tuner init dance. Returns `ErrNoDevice` if nothing matched, `ErrUnsupportedPlatform` on non-Linux. |
-| `Receiver.Read(ctx, p) (int, error)` | Fills `p` with interleaved `I, Q, I, Q, ...` bytes. Buffer sizes between 16 KiB and 256 KiB match the URB sizes used by `librtlsdr` / `dump1090`. Cancel via `ctx`. |
+| `Receiver.Read(ctx, p) (int, error)` | Returns up to `len(p)` bytes of interleaved `I, Q, I, Q, ...` from the next completed URB. One Read maps to one URB; wrap with `io.ReadFull` for fill-to-buffer semantics. Buffer sizes between 16 KiB and 256 KiB match the URB sizes used by `librtlsdr` / `dump1090`. Cancel via `ctx`. |
 | `Receiver.Close() error` | Releases the USB interface and closes the device handle. Idempotent. |
 
 ### Tuning options
@@ -87,10 +89,11 @@ Three stages on the R820T / R860 tuner: LNA, post-mixer amp, VGA. Pin individual
 | Option | Notes |
 |---|---|
 | `WithGain(tenthsDB int)` | librtlsdr-compatible single-knob ladder. Walks the chip's empirically-calibrated LNA + Mixer step pairs to land closest to the requested target; pins VGA at the librtlsdr default (+16 dB). Pass `GainAGC` to hand all three stages back to AGC. |
-| `WithLNAGain(stage GainStage)` | Per-stage override. `AutoGain` for AGC, `ManualGainStep(0..15)` to pin. Last write wins. |
+| `WithLNAGain(stage GainStage)` | Per-stage escape hatch for callers already holding a `GainStage` (e.g. from `VGAStepForCentiDB`). `AutoGain` for AGC, `ManualGainStep(0..15)` to pin. Last write wins. |
 | `WithMixerGain(stage GainStage)` | Same shape; controls the post-mixer amplifier. |
 | `WithVGAGain(stage GainStage)` | VGA scale is documented (3.5 dB/step from -12.0 dB per R860 datasheet table 6-3). Use `VGAStepForCentiDB(centi)` if a centi-dB target reads better than a step index. |
-| `WithAutoGain()` | Closed-loop search at Open time: pin Mixer + VGA at max, walk LNA from step 15 downward until the chip's `if_agc_val` mean (RTL2832U §8.1.5) climbs above the over-gained threshold. Converges in 1–3 iterations on most chains; logs the result via stdlib `log`. |
+| `WithManualLNAGain(step uint8)` | User-input-friendly variant: pins the LNA to a 4-bit code (0..15) and surfaces a `Warn`-level log entry through `WithLogger` if `step` exceeds 15 (`ManualGainStep` clamps silently — debug-hostile). Same for `WithManualMixerGain` / `WithManualVGAGain`. |
+| `WithAutoGain()` | Closed-loop search at Open time: pin Mixer + VGA at max, walk LNA from step 15 downward until the chip's `if_agc_val` mean (RTL2832U §8.1.5) climbs above the over-gained threshold. Converges in 1–3 iterations on most chains; logs the result via the configured `slog.Logger`. |
 
 `Receiver.AutoTuneGain(ctx, opts)` runs the same algorithm at runtime — useful after a band change or thermal event.
 
@@ -157,9 +160,10 @@ The chip-ID gate is strict against the datasheet's fixed value (R0 must read `0x
 ## Build & test
 
 ```sh
-make           # fmt + vet + test (race + cover)
-make lint      # golangci-lint run ./...
-make cover     # produces coverage.html
+make                  # fmt + vet + test (race + cover)
+make lint             # golangci-lint run ./...
+make cover            # produces coverage.html
+make test-integration # go test -race -tags=integration ./...
 ```
 
 Cross-compile to the deploy target:
@@ -168,20 +172,20 @@ Cross-compile to the deploy target:
 GOOS=linux GOARCH=arm64 go build ./...
 ```
 
-`go test ./...` runs the offline test suite (controller mocks; no USB needed) on every supported platform. Integration tests that touch real hardware live behind a build tag and are not run by default; see `integration_linux_test.go`.
+`go test ./...` runs the offline test suite (controller mocks; no USB needed) on every supported platform. Integration tests that touch real hardware live behind the `integration` build tag and are not run by default; see `integration_linux_test.go` and use `make test-integration` on a host with a dongle attached.
 
 ## Roadmap
 
-- **Push tuner-specific demod config behind the `Tuner` interface.**
-  Today `chip.Init()` opinionatedly enables Zero-IF; `configureForR820T`
-  walks that opinion back when an R820T2 is the actual front end. The
-  next tuner (R828D, future Rafael parts) would need a sibling override
-  doing the same dance. Cleaner shape: `Init()` becomes neutral, the
-  `Tuner` interface gains `IFFreqHz() uint32` and `OutputsRealIF() bool`,
-  and a single `chip.ConfigureForTuner(t, xtalHz)` reads the tuner's
-  requirements and writes the matching demod registers. Worth doing
-  before adding any second tuner; not urgent today since R820T2 is the
-  only hardware target that ships.
+- **Push the remaining tuner-specific demod writes behind the `Tuner` interface.**
+  The rate-driven IF-filter selection is already there — every `Tuner`
+  implements `InitializeForSampleRate(rateHz) (intFreqHz, error)` and
+  the orchestrator pipes the returned IF into the demod's DDC. What is
+  *not* yet behind the interface: `configureForR820T` (the real-IF /
+  I-only-ADC / spectrum-inversion register dance) is still called
+  unconditionally in the bring-up path because R820T is the only
+  silicon that ships today. The next tuner (R828D, future Rafael parts)
+  would want this generalised — likely an `Init(chip) error` method on
+  the `Tuner` interface so each silicon owns its demod-side prerequisites.
 
 ## License
 

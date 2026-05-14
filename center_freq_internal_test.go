@@ -30,17 +30,18 @@ func (t *fakeTuner) SetFreq(rfHz uint32) error {
 }
 
 // SetLNAGain / SetMixerGain / SetVGAGain / SetIFBandwidth /
-// SetIFHighPass / SetFilterExt are no-ops in the fake; the
-// existing center-freq tests only exercise SetFreq delegation.
-// Adding the methods here keeps fakeTuner compatible with the
-// extended Tuner interface without ballooning every center-freq
-// test with stage-call assertions.
-func (*fakeTuner) SetLNAGain(GainStage) error        { return nil }
-func (*fakeTuner) SetMixerGain(GainStage) error      { return nil }
-func (*fakeTuner) SetVGAGain(GainStage) error        { return nil }
-func (*fakeTuner) SetIFBandwidth(uint8, uint8) error { return nil }
-func (*fakeTuner) SetIFHighPass(uint8) error         { return nil }
-func (*fakeTuner) SetFilterExt(bool) error           { return nil }
+// SetIFHighPass / SetFilterExt / InitializeForSampleRate are no-ops
+// in the fake; the existing center-freq tests only exercise SetFreq
+// delegation. Adding the methods here keeps fakeTuner compatible
+// with the extended Tuner interface without ballooning every
+// center-freq test with stage-call assertions.
+func (*fakeTuner) SetLNAGain(GainStage) error                     { return nil }
+func (*fakeTuner) SetMixerGain(GainStage) error                   { return nil }
+func (*fakeTuner) SetVGAGain(GainStage) error                     { return nil }
+func (*fakeTuner) SetIFBandwidth(uint8, uint8) error              { return nil }
+func (*fakeTuner) SetIFHighPass(uint8) error                      { return nil }
+func (*fakeTuner) SetFilterExt(bool) error                        { return nil }
+func (*fakeTuner) InitializeForSampleRate(uint32) (uint32, error) { return 0, nil }
 
 func TestSetCenterFreqDelegatesToTuner(t *testing.T) {
 	t.Parallel()

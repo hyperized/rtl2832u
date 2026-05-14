@@ -18,6 +18,13 @@ func readVCOFineTuneOK() []byte {
 // detect+init. The fake's read queue is seeded with the chip-ID
 // response then a placeholder for SetFreq's own probe; the test
 // drains both before asserting.
+//
+// intFreqHz is forced to 0 so SetFreq tests reason about the
+// pure rfHz → LO mapping (Zero-IF). The real-IF offset added in
+// production (rfHz + intFreqHz) is exercised separately in
+// TestSetFreqHonoursIntFreqOffset; mixing both would force every
+// PLL-arithmetic assertion through the offset, which obscures
+// the math under test.
 func newR860ForSetFreq(t *testing.T) (*R860, *fakeI2C) {
 	t.Helper()
 
@@ -27,6 +34,8 @@ func newR860ForSetFreq(t *testing.T) (*R860, *fakeI2C) {
 	if err != nil {
 		t.Fatalf("NewR860: %v", err)
 	}
+
+	tuner.intFreqHz = 0
 
 	// Reset the captured ops so the SetFreq test sees a clean
 	// timeline starting at the open-repeater call.

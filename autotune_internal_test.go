@@ -56,11 +56,12 @@ type recordingTuner struct {
 	setVGAErr   error
 }
 
-func (*recordingTuner) Name() string                      { return "recording" }
-func (*recordingTuner) SetFreq(uint32) error              { return nil }
-func (*recordingTuner) SetIFBandwidth(uint8, uint8) error { return nil }
-func (*recordingTuner) SetIFHighPass(uint8) error         { return nil }
-func (*recordingTuner) SetFilterExt(bool) error           { return nil }
+func (*recordingTuner) Name() string                                   { return "recording" }
+func (*recordingTuner) SetFreq(uint32) error                           { return nil }
+func (*recordingTuner) SetIFBandwidth(uint8, uint8) error              { return nil }
+func (*recordingTuner) SetIFHighPass(uint8) error                      { return nil }
+func (*recordingTuner) SetFilterExt(bool) error                        { return nil }
+func (*recordingTuner) InitializeForSampleRate(uint32) (uint32, error) { return 0, nil }
 
 func (t *recordingTuner) SetLNAGain(stage GainStage) error {
 	t.lna = stage

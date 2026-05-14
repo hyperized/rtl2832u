@@ -1,10 +1,11 @@
 //go:build linux && integration
 
-package sdr_test
+package rtl2832u_test
 
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,6 +13,20 @@ import (
 
 	"github.com/hyperized/rtl2832u"
 )
+
+// receiverReader adapts a *rtl2832u.Receiver to io.Reader by
+// closing over a context. Receiver.Read takes a ctx (so callers
+// can cancel long blocks); io.Reader does not. The adapter lets
+// the integration test reuse io.ReadFull instead of hand-rolling
+// a multi-chunk fill loop.
+type receiverReader struct {
+	ctx context.Context //nolint:containedctx // adapter pattern: bridge ctx-aware reader to io.Reader.
+	rcv *rtl2832u.Receiver
+}
+
+func (r receiverReader) Read(p []byte) (int, error) {
+	return r.rcv.Read(r.ctx, p) //nolint:wrapcheck // adapter, errors are surfaced verbatim.
+}
 
 // Integration tests live behind the `integration` build tag because
 // they require a real RTL-SDR dongle plugged into the test host.
@@ -135,9 +150,11 @@ func TestIntegrationCaptureIQToFile(t *testing.T) {
 
 	buf := make([]byte, captureBytes)
 
-	count, err := rcv.Read(ctx, buf)
+	// Receiver.Read returns one URB chunk at a time; io.ReadFull
+	// is the standard way to fill a multi-chunk buffer.
+	count, err := io.ReadFull(receiverReader{ctx: ctx, rcv: rcv}, buf)
 	if err != nil {
-		t.Fatalf("Receiver.Read: %v (got %d bytes before failure)", err, count)
+		t.Fatalf("io.ReadFull: %v (got %d bytes before failure)", err, count)
 	}
 
 	if count != captureBytes {

@@ -1,8 +1,11 @@
 package rtl2832u_test
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/hyperized/rtl2832u"
@@ -67,5 +70,37 @@ func TestOpenAppliesOptionsBeforeFailing(t *testing.T) {
 
 	if rcv != nil {
 		t.Error("non-nil Receiver returned alongside error")
+	}
+}
+
+// TestOpenFlushesClampingWarning asserts the contract that Open
+// runs the option list, then flushes any accumulated warnings
+// through the configured logger BEFORE attempting to touch
+// hardware. Pass WithFrequencyCorrection well outside the clamp
+// range; the warning must appear in the logger's buffer even when
+// openBackend fails immediately afterwards (no hardware present).
+func TestOpenFlushesClampingWarning(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	rcv, err := rtl2832u.Open(
+		rtl2832u.WithLogger(logger),
+		rtl2832u.WithFrequencyCorrection(5_000),
+	)
+	if rcv != nil {
+		_ = rcv.Close()
+	}
+
+	if err == nil {
+		t.Skip("RTL-SDR appears connected; skipping warning-flush contract test")
+	}
+
+	// Warning must mention the clamp; we don't pin the exact phrase
+	// so future copywriting tweaks don't break the test.
+	if got := buf.String(); !strings.Contains(got, "WithFrequencyCorrection") || !strings.Contains(got, "clamped") {
+		t.Errorf("logger output = %q, expected a WithFrequencyCorrection clamp warning", got)
 	}
 }

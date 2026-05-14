@@ -339,11 +339,7 @@ func (b *linuxBackend) runStreamReaper() {
 			return
 		}
 
-		b.mu.Lock()
-		shutdown := b.closed
-		b.mu.Unlock()
-
-		if shutdown {
+		if b.closed.Load() {
 			pending--
 
 			continue

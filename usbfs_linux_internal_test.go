@@ -82,7 +82,8 @@ func TestLinuxBackendCloseIdempotent(t *testing.T) {
 	// release/close ioctls are never invoked even though dev is nil.
 	// The test asserts both that the first call succeeds and that a
 	// second call still does — the contract for idempotent Close.
-	back := &linuxBackend{closed: true}
+	back := &linuxBackend{}
+	back.closed.Store(true)
 
 	if err := back.Close(); err != nil {
 		t.Fatalf("first Close on already-closed backend = %v, want nil", err)

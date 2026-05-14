@@ -489,10 +489,10 @@ func captureSinkLabel(path string) string {
 // Exit codes. Stable for scripting.
 const (
 	exitOK            = 0
-	exitOpenFailed    = 1
-	exitProbeFailed   = 1
-	exitCaptureFailed = 1
 	exitUsage         = 2
+	exitOpenFailed    = 3
+	exitProbeFailed   = 4
+	exitCaptureFailed = 5
 )
 
 func main() {

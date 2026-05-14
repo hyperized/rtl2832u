@@ -79,6 +79,13 @@ type config struct {
 	// to stderr, which most TUI frameworks render onto the draw
 	// surface.
 	logger *slog.Logger
+
+	// warnings accumulates messages emitted by options that
+	// silently sanitised user input (e.g. clamping an out-of-range
+	// frequency correction). Open flushes the slice through
+	// cfg.logger.Warn after every option has run, so the warnings
+	// appear before any I/O begins.
+	warnings []string
 }
 
 // biasTeeSetting holds an optional bias-tee override. The chip's
@@ -189,23 +196,87 @@ func WithGain(tenthsDB int) Option {
 // WithLNAGain overrides the LNA gain stage. Pass AutoGain for AGC,
 // or ManualGainStep(0..15) to pin. Per-stage options layer on top
 // of WithGain; a later option wins.
+//
+// ManualGainStep silently clamps out-of-range values; prefer
+// WithManualLNAGain when the step comes from user input — that
+// helper accumulates a Warn-level log entry when the value
+// exceeds the chip's 4-bit code range, so the operator sees the
+// substitution.
 func WithLNAGain(stage GainStage) Option {
 	return func(c *config) { c.lnaGain = stage }
 }
 
 // WithMixerGain overrides the post-mixer-amplifier gain stage.
-// Same conventions as WithLNAGain.
+// Same conventions as WithLNAGain; see WithManualMixerGain for
+// the user-input-friendly variant that surfaces clamping.
 func WithMixerGain(stage GainStage) Option {
 	return func(c *config) { c.mixerGain = stage }
 }
 
-// WithVGAGain overrides the VGA stage. Pass AutoGain to leave the
-// VGA on the IF_AGC pin (the demod's DAGC then drives it), or
-// ManualGainStep(0..15) / VGAStepForCentiDB(centi) to pin.
-// VGA_CODE 0..15 maps to -12.0 dB through +40.5 dB in 3.5 dB
-// increments per R860 datasheet table 6-3.
+// WithVGAGain overrides the VGA stage. Pass AutoGain to track
+// librtlsdr's r82xx_set_gain auto branch (VGA_CODE pinned at the
+// 0x0b "AGC entry point" while the LNA + Mixer AGC loops ride
+// above it — the IF_AGC pin path is not used because the demod's
+// RF/IF AGC loop is disabled on R820T silicon to keep it from
+// fighting the tuner's own loops). Or pass ManualGainStep(0..15)
+// / VGAStepForCentiDB(centi) to pin. VGA_CODE 0..15 maps to
+// -12.0 dB through +40.5 dB in 3.5 dB increments per R860
+// datasheet table 6-3. See WithManualVGAGain for the variant
+// that surfaces clamping.
 func WithVGAGain(stage GainStage) Option {
 	return func(c *config) { c.vgaGain = stage }
+}
+
+// gainStepMax is the upper bound of the R860's 4-bit gain code
+// shared by every manual stage. Kept here (and re-asserted against
+// r860GainStepCount in the tuner package) so the option layer
+// never imports tuner-internal constants.
+const gainStepMax uint8 = 15
+
+// clampGainStep validates step against the R860's 4-bit code range
+// and, if out of range, appends a Warn-level message to cfg.warnings
+// describing the substitution. Returns the clamped step. The stage
+// parameter is the human-readable name used in the warning ("LNA",
+// "Mixer", "VGA") — keep it short, it ends up in operator logs.
+func clampGainStep(cfg *config, stage string, step uint8) uint8 {
+	if step <= gainStepMax {
+		return step
+	}
+
+	cfg.warnings = append(cfg.warnings, fmt.Sprintf(
+		"WithManual%sGain: step=%d clamped to %d (max)",
+		stage, step, gainStepMax))
+
+	return gainStepMax
+}
+
+// WithManualLNAGain pins the LNA to a 4-bit gain code, surfacing a
+// Warn-level log entry through cfg.logger when step exceeds 15.
+// Prefer this over WithLNAGain(ManualGainStep(...)) when step
+// originates from user input (CLI flag, config file): the silent
+// clamp inside ManualGainStep is hard to debug from logs.
+func WithManualLNAGain(step uint8) Option {
+	return func(cfg *config) {
+		cfg.lnaGain = GainStage{Step: clampGainStep(cfg, "LNA", step)}
+	}
+}
+
+// WithManualMixerGain pins the post-mixer-amplifier to a 4-bit gain
+// code with the same range-warning behaviour as WithManualLNAGain.
+func WithManualMixerGain(step uint8) Option {
+	return func(cfg *config) {
+		cfg.mixerGain = GainStage{Step: clampGainStep(cfg, "Mixer", step)}
+	}
+}
+
+// WithManualVGAGain pins the VGA to a 4-bit VGA_CODE with the same
+// range-warning behaviour as WithManualLNAGain. For dB-based input
+// use VGAStepForCentiDB plus WithVGAGain — that helper does its
+// own boundary clamp on dB rather than on the raw code.
+func WithManualVGAGain(step uint8) Option {
+	return func(cfg *config) {
+		cfg.vgaGain = GainStage{Step: clampGainStep(cfg, "VGA", step)}
+	}
 }
 
 // WithIFBandwidth overrides the R860's channel-filter
@@ -312,17 +383,25 @@ const FrequencyCorrectionPPMMax = 1000
 // reference reads the chip's clock above nominal). Pass the value
 // you would write into librtlsdr's rtlsdr_set_freq_correction.
 //
-// Values outside ±FrequencyCorrectionPPMMax are silently clamped to
-// the boundary; functional options can't return errors and the
-// alternative (panicking) is a poor library citizen. Zero is the
-// default and is a no-op.
+// Values outside ±FrequencyCorrectionPPMMax are clamped to the
+// boundary; functional options can't return errors and the
+// alternative (panicking) is a poor library citizen. Clamping is
+// surfaced via the cfg.logger as a Warn-level entry from Open, so
+// the operator sees the substitution even though no error is
+// returned. Zero is the default and is a no-op.
 func WithFrequencyCorrection(ppm int) Option {
 	return func(cfg *config) {
 		switch {
 		case ppm > FrequencyCorrectionPPMMax:
 			cfg.freqCorrectionPPM = FrequencyCorrectionPPMMax
+			cfg.warnings = append(cfg.warnings, fmt.Sprintf(
+				"WithFrequencyCorrection: ppm=%d clamped to +%d (max)",
+				ppm, FrequencyCorrectionPPMMax))
 		case ppm < -FrequencyCorrectionPPMMax:
 			cfg.freqCorrectionPPM = -FrequencyCorrectionPPMMax
+			cfg.warnings = append(cfg.warnings, fmt.Sprintf(
+				"WithFrequencyCorrection: ppm=%d clamped to %d (min)",
+				ppm, -FrequencyCorrectionPPMMax))
 		default:
 			cfg.freqCorrectionPPM = int32(ppm)
 		}
@@ -369,10 +448,19 @@ type backend interface {
 // chip-initialised demodulator. Tuning to a centre frequency requires
 // a Tuner; bulk reads land once the URB ring is in place. Always
 // Close the Receiver when done.
+//
+// Open flushes any warnings options accumulated (e.g. clamped
+// frequency correction) through cfg.logger.Warn before touching
+// hardware, so the operator sees substitutions even when no error
+// is returned.
 func Open(opts ...Option) (*Receiver, error) {
 	cfg := defaultConfig()
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+
+	for _, warning := range cfg.warnings {
+		cfg.logger.Warn(warning)
 	}
 
 	b, err := openBackend(cfg)
@@ -383,10 +471,17 @@ func Open(opts ...Option) (*Receiver, error) {
 	return &Receiver{cfg: cfg, backend: b}, nil
 }
 
-// Read fills p with interleaved unsigned 8-bit IQ samples
-// (I, Q, I, Q, ...) and returns the number of bytes written. The buffer
-// length determines USB transfer pacing; values between 16 KiB and 256
-// KiB match the URB sizes used by librtlsdr and dump1090.
+// Read returns up to len(p) bytes of interleaved unsigned 8-bit
+// IQ samples (I, Q, I, Q, ...) from the next completed URB. It
+// blocks until a chunk arrives, the stream ends, or ctx is
+// cancelled. A single Read maps to a single URB completion;
+// callers needing fill-to-buffer semantics across multiple URBs
+// must wrap with io.ReadFull. Buffer sizes between 16 KiB and
+// 256 KiB match the URB sizes used by librtlsdr and dump1090.
+//
+// Receiver is single-producer: usbfs serialises bulk transfers,
+// so concurrent calls to Read from multiple goroutines are not
+// supported.
 func (r *Receiver) Read(ctx context.Context, p []byte) (int, error) {
 	n, err := r.backend.Read(ctx, p)
 	if err != nil {

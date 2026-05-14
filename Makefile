@@ -1,4 +1,4 @@
-.PHONY: all fmt vet test lint cover build build-aarch64 clean
+.PHONY: all fmt vet test test-integration lint cover build build-aarch64 clean
 
 PKG          := ./...
 COVERPROFILE := coverage.out
@@ -14,6 +14,9 @@ vet:
 
 test:
 	go test -race -cover -coverprofile=$(COVERPROFILE) $(PKG)
+
+test-integration:
+	go test -race -tags=integration $(PKG)
 
 cover: test
 	go tool cover -html=$(COVERPROFILE) -o coverage.html
