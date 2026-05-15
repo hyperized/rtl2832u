@@ -915,10 +915,15 @@ func TestReceiverAutoTuneGainDelegates(t *testing.T) {
 	t.Parallel()
 
 	want := AutoTuneResult{
-		LNA:        ManualGainStep(12),
-		Mixer:      ManualGainStep(15),
-		VGA:        ManualGainStep(15),
-		FinalIFAGC: -1500,
+		LNA:   ManualGainStep(12),
+		Mixer: ManualGainStep(15),
+		VGA:   ManualGainStep(15),
+		FinalStats: SampleStats{
+			Samples:        8192,
+			RMS:            45.0,
+			Peak:           120.0,
+			SaturationFrac: 0.001,
+		},
 		Iterations: 4,
 	}
 

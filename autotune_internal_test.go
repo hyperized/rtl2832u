@@ -7,38 +7,6 @@ import (
 	"time"
 )
 
-// errScriptedSamplerExhausted fires when a test under-provisions
-// the scriptedSampler queue; signals it as a sentinel rather than
-// a dynamic ad-hoc error.
-var errScriptedSamplerExhausted = errors.New("scriptedSampler: exhausted")
-
-// errSamplerBoom is the sentinel for the propagation test below.
-var errSamplerBoom = errors.New("sampler boom")
-
-// scriptedSampler returns a queued sequence of IFAGC values, one
-// per SignalStats call. Lets tests drive the auto-tune search
-// through a deterministic AGC trajectory without timing dependencies.
-type scriptedSampler struct {
-	ifValues []int
-	next     int
-	err      error
-}
-
-func (s *scriptedSampler) SignalStats() (SignalStats, error) {
-	if s.err != nil {
-		return SignalStats{}, s.err
-	}
-
-	if s.next >= len(s.ifValues) {
-		return SignalStats{}, errScriptedSamplerExhausted
-	}
-
-	value := s.ifValues[s.next]
-	s.next++
-
-	return SignalStats{IFAGCValue: int16(value)}, nil //nolint:gosec // test fixture; values fit int16.
-}
-
 // recordingTuner remembers the most recent gain steps requested
 // per stage so tests can assert which configuration auto-tune
 // converged on.
@@ -84,29 +52,53 @@ func (t *recordingTuner) SetVGAGain(stage GainStage) error {
 	return t.setVGAErr
 }
 
-// fastTuneOptions returns AutoTuneOptions with the wait/sample
-// durations zeroed so tests don't actually sleep. SettleDelay and
-// SampleInterval default to small values via orDefaults; passing
-// 1ns lets the time.After fire immediately.
+// fastTuneOptions returns AutoTuneOptions with SettleDelay zeroed
+// so tests don't sleep. SampleTarget is set small enough that one
+// canned chunk satisfies a probe.
 func fastTuneOptions() AutoTuneOptions {
 	return AutoTuneOptions{
-		SettleDelay:    1 * time.Nanosecond,
-		SampleCount:    4,
-		SampleInterval: 1 * time.Nanosecond,
+		SettleDelay:         1 * time.Nanosecond,
+		SampleTarget:        4,
+		SaturationThreshold: 0.005,
 	}
+}
+
+// cleanChunk builds a byte slice of `samples` I/Q pairs all at raw
+// 0x80 (midrange), so SaturationFrac is 0.
+func cleanChunk(samples int) []byte {
+	const dcMid = 0x80
+
+	out := make([]byte, samples*2)
+	for i := range out {
+		out[i] = dcMid
+	}
+
+	return out
+}
+
+// saturatedChunk builds a byte slice of `samples` I/Q pairs all at
+// raw 0xFF, so SaturationFrac is 1.0.
+func saturatedChunk(samples int) []byte {
+	out := make([]byte, samples*2)
+	for i := range out {
+		out[i] = 0xFF
+	}
+
+	return out
 }
 
 func TestAutoTuneGainStaysAtMaxOnPassiveAntenna(t *testing.T) {
 	t.Parallel()
 
-	// Passive antenna ≈ chip is happy at all-stages-max: AGC
-	// returns mild values (well above the over-gained threshold).
-	// Returning constant -300 across all 4 samples means mean
-	// stays > -3500 → algorithm exits at LNA=15 immediately.
-	sampler := &scriptedSampler{ifValues: []int{-300, -300, -300, -300}}
+	// Passive antenna ≈ ADC sees no saturation at LNA=15 →
+	// algorithm converges at the top step immediately.
+	reader := &scriptedSampleReader{
+		chunks:     [][]byte{cleanChunk(4)},
+		queueEmpty: errSampleReaderBoom,
+	}
 	tuner := &recordingTuner{}
 
-	result, err := autoTuneGain(t.Context(), tuner, sampler, fastTuneOptions())
+	result, err := autoTuneGain(t.Context(), tuner, reader, fastTuneOptions())
 	if err != nil {
 		t.Fatalf("autoTuneGain: %v", err)
 	}
@@ -123,24 +115,26 @@ func TestAutoTuneGainStaysAtMaxOnPassiveAntenna(t *testing.T) {
 		t.Errorf("iterations = %d, want 1", result.Iterations)
 	}
 
-	if result.FinalIFAGC != -300 {
-		t.Errorf("FinalIFAGC = %d, want -300", result.FinalIFAGC)
+	if result.FinalStats.SaturationFrac != 0 {
+		t.Errorf("FinalStats.SaturationFrac = %v, want 0", result.FinalStats.SaturationFrac)
 	}
 }
 
 func TestAutoTuneGainDescendsWhenOvergained(t *testing.T) {
 	t.Parallel()
 
-	// Hot RF chain: at LNA=15 the chip is severely over-gained
-	// (mean -7000); dropping to LNA=14 brings it into the
-	// deadband (-2000). 4 samples per iteration × 2 iterations.
-	sampler := &scriptedSampler{ifValues: []int{
-		-7000, -7000, -7000, -7000, // LNA=15: mean -7000, drop
-		-2000, -2000, -2000, -2000, // LNA=14: mean -2000, accept
-	}}
+	// Hot RF chain: at LNA=15 the ADC saturates; at LNA=14 it
+	// recovers. Algorithm should walk down one step.
+	reader := &scriptedSampleReader{
+		chunks: [][]byte{
+			saturatedChunk(4), // LNA=15: 100% saturation, drop
+			cleanChunk(4),     // LNA=14: 0% saturation, accept
+		},
+		queueEmpty: errSampleReaderBoom,
+	}
 	tuner := &recordingTuner{}
 
-	result, err := autoTuneGain(t.Context(), tuner, sampler, fastTuneOptions())
+	result, err := autoTuneGain(t.Context(), tuner, reader, fastTuneOptions())
 	if err != nil {
 		t.Fatalf("autoTuneGain: %v", err)
 	}
@@ -166,20 +160,23 @@ func TestAutoTuneGainDescendsWhenOvergained(t *testing.T) {
 func TestAutoTuneGainBottomsOutAtLNAZero(t *testing.T) {
 	t.Parallel()
 
-	// Pathologically hot input: AGC stays severely over-gained
-	// even at LNA=0. Algorithm must terminate at the floor
+	// Pathologically hot input: every LNA step still reports
+	// 100% saturation. Algorithm must terminate at the floor
 	// without underflowing the uint8 step counter.
 	const stepCount = 16
 
-	values := make([]int, stepCount*4) // 4 samples per LNA step
-	for i := range values {
-		values[i] = -8000
+	chunks := make([][]byte, stepCount)
+	for i := range chunks {
+		chunks[i] = saturatedChunk(4)
 	}
 
-	sampler := &scriptedSampler{ifValues: values}
+	reader := &scriptedSampleReader{
+		chunks:     chunks,
+		queueEmpty: errSampleReaderBoom,
+	}
 	tuner := &recordingTuner{}
 
-	result, err := autoTuneGain(t.Context(), tuner, sampler, fastTuneOptions())
+	result, err := autoTuneGain(t.Context(), tuner, reader, fastTuneOptions())
 	if err != nil {
 		t.Fatalf("autoTuneGain: %v", err)
 	}
@@ -191,6 +188,10 @@ func TestAutoTuneGainBottomsOutAtLNAZero(t *testing.T) {
 	if result.Iterations != stepCount {
 		t.Errorf("iterations = %d, want %d", result.Iterations, stepCount)
 	}
+
+	if result.FinalStats.SaturationFrac != 1.0 {
+		t.Errorf("FinalStats.SaturationFrac = %v, want 1.0 at LNA floor", result.FinalStats.SaturationFrac)
+	}
 }
 
 func TestAutoTuneGainContextCancelDuringSettle(t *testing.T) {
@@ -199,27 +200,27 @@ func TestAutoTuneGainContextCancelDuringSettle(t *testing.T) {
 	tuner := &recordingTuner{}
 	// Long settle so cancellation lands in the time.After branch.
 	opts := AutoTuneOptions{
-		SettleDelay:    1 * time.Hour,
-		SampleCount:    1,
-		SampleInterval: 1 * time.Nanosecond,
+		SettleDelay:         1 * time.Hour,
+		SampleTarget:        1,
+		SaturationThreshold: 0.005,
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	if _, err := autoTuneGain(ctx, tuner, &scriptedSampler{}, opts); !errors.Is(err, context.Canceled) {
+	if _, err := autoTuneGain(ctx, tuner, &scriptedSampleReader{}, opts); !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }
 
-func TestAutoTuneGainPropagatesSamplerError(t *testing.T) {
+func TestAutoTuneGainPropagatesReaderError(t *testing.T) {
 	t.Parallel()
 
 	tuner := &recordingTuner{}
-	sampler := &scriptedSampler{err: errSamplerBoom}
+	reader := &scriptedSampleReader{err: errSampleReaderBoom}
 
-	if _, err := autoTuneGain(t.Context(), tuner, sampler, fastTuneOptions()); !errors.Is(err, errSamplerBoom) {
-		t.Errorf("err = %v, want wrapping errSamplerBoom", err)
+	if _, err := autoTuneGain(t.Context(), tuner, reader, fastTuneOptions()); !errors.Is(err, errSampleReaderBoom) {
+		t.Errorf("err = %v, want wrapping errSampleReaderBoom", err)
 	}
 }
 
@@ -235,46 +236,20 @@ func TestAutoTuneGainPropagatesTunerError(t *testing.T) {
 		{"lna", func() *recordingTuner { return &recordingTuner{setLNAErr: errFakeTuner} }},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			sampler := &scriptedSampler{ifValues: []int{0, 0, 0, 0}}
-			if _, err := autoTuneGain(t.Context(), tc.mk(), sampler, fastTuneOptions()); !errors.Is(err, errFakeTuner) {
+			reader := &scriptedSampleReader{
+				chunks:     [][]byte{cleanChunk(4)},
+				queueEmpty: errSampleReaderBoom,
+			}
+
+			_, err := autoTuneGain(t.Context(), testCase.mk(), reader, fastTuneOptions())
+			if !errors.Is(err, errFakeTuner) {
 				t.Errorf("err = %v, want wrapping errFakeTuner", err)
 			}
 		})
-	}
-}
-
-func TestSampleIFAGCMeanSingleSample(t *testing.T) {
-	t.Parallel()
-
-	// count=1 hits the early-break-after-first-sample path (no
-	// inter-sample wait), which the multi-iteration tests above
-	// don't reach because they all use count >= 4.
-	sampler := &scriptedSampler{ifValues: []int{-1234}}
-
-	mean, err := sampleIFAGCMean(t.Context(), sampler, 1, 1*time.Nanosecond)
-	if err != nil {
-		t.Fatalf("sampleIFAGCMean: %v", err)
-	}
-
-	if mean != -1234 {
-		t.Errorf("mean = %d, want -1234", mean)
-	}
-}
-
-func TestSampleIFAGCMeanCancelDuringInterval(t *testing.T) {
-	t.Parallel()
-
-	sampler := &scriptedSampler{ifValues: []int{0, 0}}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-
-	if _, err := sampleIFAGCMean(ctx, sampler, 2, 1*time.Hour); !errors.Is(err, context.Canceled) {
-		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }
 
@@ -287,30 +262,24 @@ func TestAutoTuneOptionsOrDefaults(t *testing.T) {
 		t.Errorf("SettleDelay = %v, want positive default", opts.SettleDelay)
 	}
 
-	if opts.SampleCount <= 0 {
-		t.Errorf("SampleCount = %d, want positive default", opts.SampleCount)
+	if opts.SampleTarget <= 0 {
+		t.Errorf("SampleTarget = %d, want positive default", opts.SampleTarget)
 	}
 
-	if opts.SampleInterval <= 0 {
-		t.Errorf("SampleInterval = %v, want positive default", opts.SampleInterval)
-	}
-
-	if opts.OvergainedThreshold == 0 {
-		t.Error("OvergainedThreshold = 0, want non-zero default")
+	if opts.SaturationThreshold <= 0 {
+		t.Errorf("SaturationThreshold = %v, want positive default", opts.SaturationThreshold)
 	}
 
 	// Pre-set values are preserved.
 	custom := AutoTuneOptions{
 		SettleDelay:         42 * time.Millisecond,
-		SampleCount:         99,
-		SampleInterval:      7 * time.Millisecond,
-		OvergainedThreshold: -1234,
+		SampleTarget:        99,
+		SaturationThreshold: 0.01,
 	}.orDefaults()
 
 	if custom.SettleDelay != 42*time.Millisecond ||
-		custom.SampleCount != 99 ||
-		custom.SampleInterval != 7*time.Millisecond ||
-		custom.OvergainedThreshold != -1234 {
+		custom.SampleTarget != 99 ||
+		custom.SaturationThreshold != 0.01 {
 		t.Errorf("preset overrides not preserved: %+v", custom)
 	}
 }

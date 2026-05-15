@@ -27,11 +27,18 @@ import (
 // less of the gain budget.
 //
 // Auto-tune resolves "do I have an external LNA or not?" without
-// the user having to know: it sets all stages to max, asks the
-// RTL2832U's IF AGC how it feels (datasheet §8.1.5
-// if_agc_val readback), and only steps the LNA down when the IF
-// AGC is severely demanding more attenuation than the VGA can
-// provide.
+// the user having to know: it sets all stages to max, samples the
+// dongle's I/Q stream, and only steps the LNA down when the ADC
+// is clipping (overload from too much gain in front of it).
+//
+// Metric: SampleStats.SaturationFrac (fraction of raw samples
+// landing at ADC rail 0x00 / 0xFF). Earlier iterations of this
+// code used SignalStats.IFAGCValue, but init_chip.go disables the
+// chip's demod-side RF/IF AGC loops on the R820T2 path to avoid a
+// feedback fight with the tuner's VGA — leaving those registers
+// effectively static and unable to drive any search. The host-
+// side saturation count is independent of the chip's AGC state
+// and always reflects current ADC conditions.
 //
 // The algorithm is intentionally one-dimensional. Pinning Mixer
 // and VGA at their maxima isolates the trade-off to LNA, which
@@ -44,87 +51,97 @@ import (
 // pick conservative defaults; a caller can override individual
 // fields without losing the others.
 type AutoTuneOptions struct {
-	// SettleDelay is how long to wait after each gain change
-	// before sampling the AGC. The chip's IF AGC loop with
-	// loop_gain2 = 4 stabilises in about 200 ms; 500 ms is the
-	// safe default.
+	// SettleDelay is how long to wait after each LNA change
+	// before sampling. Two effects gate the lower bound: the
+	// tuner's analogue settle time (sub-millisecond on the
+	// R820T2) and the URB ring's drop-oldest buffering (~110 ms
+	// of pre-change samples sit in the ring until the producer
+	// overwrites them). 500 ms is the safe default — well past
+	// both.
 	SettleDelay time.Duration
 
-	// SampleCount is how many SignalStats reads to average for
-	// each candidate gain config. ADS-B is bursty so the AGC
-	// hunts; a single read is unreliable. 16 samples × 30 ms
-	// covers most of an aircraft transmission cycle.
-	SampleCount int
+	// SampleTarget is the minimum number of I/Q pairs to read
+	// per probe. ReadSampleStats consumes whole URBs, so the
+	// actual count rounds up to the nearest URB boundary
+	// (16 KiB bytes = 8 KiB samples at the driver's default
+	// URB length).
+	//
+	// Why 128 K (≈54 ms at 2.4 MS/s): ADS-B is bursty.
+	// Aggregate traffic is ~100 frames/sec across all aircraft;
+	// each frame is ~120 µs. Per-window saturation count is
+	// dominated by how many bursts the probe happens to catch.
+	// Shorter windows (3.4 ms with 8 K samples) had a ~3×
+	// burst-count swing between probes, dragging the LNA walk
+	// all the way to the floor on hot probes. 128 K samples
+	// averages ~5 bursts per window so SaturationFrac
+	// stabilises.
+	SampleTarget int
 
-	// SampleInterval is the spacing between SignalStats reads
-	// inside one window.
-	SampleInterval time.Duration
-
-	// OvergainedThreshold is the if_agc_val mean below which the
-	// chip is considered "severely over-gained" and the LNA
-	// should be dropped. Values close to zero indicate a
-	// comfortable AGC; large negative means the chip is fighting
-	// to attenuate. -3500 sits near halfway to the saturation
-	// floor of -8192 — past this point the AGC has lost most of
-	// its dynamic range.
-	OvergainedThreshold int
+	// SaturationThreshold is the maximum SaturationFrac the
+	// algorithm tolerates at the converged LNA step.
+	//
+	// Default 0.05 (5%) — calibrated for ADS-B's bursty signal
+	// model. Brief ADC clipping during a valid burst doesn't
+	// hurt decode: the bit slicer cares about half-bit timing,
+	// not absolute amplitude. True chain overload (intermod or
+	// out-of-band emitters) shows up as *continuous* saturation
+	// in the 10–50% range, comfortably above the threshold.
+	//
+	// Tuned empirically on radio (192.168.1.159) with a SAW →
+	// USB-LNA → RTL-SDR v3 chain in 2026-05: the manual
+	// gain-200 sweep optimum reports ~4% saturation in the
+	// probe-stats window and decodes ~24 DF17/min; the 5%
+	// threshold lands the autotune in the same operating
+	// region. Tighter thresholds (0.5% / 2%) walked LNA too
+	// low, losing 50% of the DF17 yield.
+	SaturationThreshold float64
 }
 
 func (o AutoTuneOptions) orDefaults() AutoTuneOptions {
 	const (
 		defaultSettle    = 500 * time.Millisecond
-		defaultSamples   = 16
-		defaultInterval  = 30 * time.Millisecond
-		defaultThreshold = -3500
+		defaultSamples   = 128 * 1024
+		defaultThreshold = 0.05
 	)
 
 	if o.SettleDelay <= 0 {
 		o.SettleDelay = defaultSettle
 	}
 
-	if o.SampleCount <= 0 {
-		o.SampleCount = defaultSamples
+	if o.SampleTarget <= 0 {
+		o.SampleTarget = defaultSamples
 	}
 
-	if o.SampleInterval <= 0 {
-		o.SampleInterval = defaultInterval
-	}
-
-	if o.OvergainedThreshold == 0 {
-		o.OvergainedThreshold = defaultThreshold
+	if o.SaturationThreshold <= 0 {
+		o.SaturationThreshold = defaultThreshold
 	}
 
 	return o
 }
 
 // AutoTuneResult records the gain configuration auto-tune
-// converged on plus the if_agc_val mean it observed at that
-// config — useful for logging and for callers that want to
-// re-decide on retune.
+// converged on, plus the SampleStats it observed at that config —
+// useful for logging and for callers that want to re-decide on a
+// retune. FinalStats.SaturationFrac is the metric the algorithm
+// optimised against.
 type AutoTuneResult struct {
 	LNA        GainStage
 	Mixer      GainStage
 	VGA        GainStage
-	FinalIFAGC int
+	FinalStats SampleStats
 	Iterations int
-}
-
-// signalSampler is the slice of Receiver / backend that AutoTuneGain
-// needs. Defining it as a small interface keeps autoTuneGain
-// callable from tests with a stub that returns canned stats.
-type signalSampler interface {
-	SignalStats() (SignalStats, error)
 }
 
 // autoTuneGain runs the gradient-descent search described at the
 // top of the file. It pins Mixer and VGA at their maxima, then
-// walks LNA from 15 downward until the IF AGC mean climbs above
-// the over-gained threshold (or LNA hits zero, the saturation
-// floor). The final Tuner state matches the returned result.
+// walks LNA from 15 downward until ReadSampleStats reports
+// SaturationFrac at or below the threshold (or LNA hits zero, the
+// saturation floor). The final Tuner state matches the returned
+// result.
 func autoTuneGain(
 	ctx context.Context,
 	tuner Tuner,
-	sampler signalSampler,
+	reader sampleReader,
 	opts AutoTuneOptions,
 ) (AutoTuneResult, error) {
 	opts = opts.orDefaults()
@@ -156,7 +173,7 @@ func autoTuneGain(
 			return AutoTuneResult{}, err
 		}
 
-		mean, err := sampleIFAGCMean(ctx, sampler, opts.SampleCount, opts.SampleInterval)
+		stats, err := readSampleStats(ctx, reader, opts.SampleTarget, sampleStatsReadBuf)
 		if err != nil {
 			return AutoTuneResult{}, fmt.Errorf("autotune: sample at LNA=%d: %w", lnaStep, err)
 		}
@@ -164,47 +181,16 @@ func autoTuneGain(
 		// topLNA - lnaStep + 1 = number of iterations completed (1..16).
 		iterations := int(topLNA-lnaStep) + 1
 
-		if mean > opts.OvergainedThreshold || lnaStep == 0 {
+		if stats.SaturationFrac <= opts.SaturationThreshold || lnaStep == 0 {
 			return AutoTuneResult{
 				LNA:        lna,
 				Mixer:      mixer,
 				VGA:        vga,
-				FinalIFAGC: mean,
+				FinalStats: stats,
 				Iterations: iterations,
 			}, nil
 		}
 	}
-}
-
-// sampleIFAGCMean takes opts.SampleCount SignalStats readings at
-// opts.SampleInterval apart and returns the arithmetic mean of
-// IFAGCValue. Cancellation propagates through ctx.
-func sampleIFAGCMean(
-	ctx context.Context,
-	sampler signalSampler,
-	count int,
-	interval time.Duration,
-) (int, error) {
-	sum := 0
-
-	for sampleIdx := range count {
-		stats, err := sampler.SignalStats()
-		if err != nil {
-			return 0, fmt.Errorf("sample %d/%d: %w", sampleIdx+1, count, err)
-		}
-
-		sum += int(stats.IFAGCValue)
-
-		if sampleIdx == count-1 {
-			break
-		}
-
-		if err := waitOrCancel(ctx, interval); err != nil {
-			return 0, err
-		}
-	}
-
-	return sum / count, nil
 }
 
 // waitOrCancel sleeps for d unless ctx is cancelled first, in

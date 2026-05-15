@@ -185,7 +185,9 @@ func runAutoTuneAtOpen(back *linuxBackend) error {
 		slog.Int("lna_step", int(result.LNA.Step)),
 		slog.Int("mixer_step", int(result.Mixer.Step)),
 		slog.Int("vga_step", int(result.VGA.Step)),
-		slog.Int("if_agc_mean", result.FinalIFAGC),
+		slog.Float64("saturation_frac", result.FinalStats.SaturationFrac),
+		slog.Float64("rms", result.FinalStats.RMS),
+		slog.Float64("peak", result.FinalStats.Peak),
 		slog.Int("iterations", result.Iterations),
 	)
 
@@ -594,7 +596,7 @@ func (b *linuxBackend) SignalStats() (SignalStats, error) {
 
 // AutoTuneGain satisfies the backend interface. Runs the
 // gradient-descent search defined in autotune.go against the
-// retained tuner and the demod's AGC readback registers.
+// retained tuner and the bulk-endpoint sample stream.
 func (b *linuxBackend) AutoTuneGain(ctx context.Context, opts AutoTuneOptions) (AutoTuneResult, error) {
 	return autoTuneGain(ctx, b.tuner, b, opts)
 }
