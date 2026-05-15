@@ -161,6 +161,10 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 type receiver interface {
 	Read(ctx context.Context, p []byte) (int, error)
 	ReadSampleStats(ctx context.Context, targetSamples int) (rtl2832u.SampleStats, error)
+	SetLNAGain(step uint8) error
+	SetMixerGain(step uint8) error
+	SetVGAGain(step uint8) error
+	SetBiasTee(enable bool) error
 	Close() error
 }
 

@@ -750,14 +750,25 @@ func TestBlendSpectrumEMAFormula(t *testing.T) {
 func TestRenderFooterErrorBranch(t *testing.T) {
 	t.Parallel()
 
-	clean := renderFooter(nil)
+	state := gainState{lnaStep: 15, mixerStep: 15, vgaStep: 15}
+
+	clean := renderFooter(state, nil, nil)
 	if !strings.Contains(clean, "quit") {
 		t.Errorf("clean footer missing quit hint: %q", clean)
 	}
 
-	withErr := renderFooter(errTUITest)
-	if !strings.Contains(withErr, "sampler error: rtl-probe tui test error") {
-		t.Errorf("error footer missing diagnostic: %q", withErr)
+	if !strings.Contains(clean, "LNA=15") {
+		t.Errorf("clean footer missing gain state: %q", clean)
+	}
+
+	withSamplerErr := renderFooter(state, errTUITest, nil)
+	if !strings.Contains(withSamplerErr, "sampler error: rtl-probe tui test error") {
+		t.Errorf("sampler-error footer missing diagnostic: %q", withSamplerErr)
+	}
+
+	withControlErr := renderFooter(state, nil, errTUITest)
+	if !strings.Contains(withControlErr, "last control: rtl-probe tui test error") {
+		t.Errorf("control-error footer missing diagnostic: %q", withControlErr)
 	}
 }
 
@@ -803,4 +814,149 @@ func (s *stubRawSampler) Read(_ context.Context, dst []byte) (int, error) {
 	}
 
 	return copy(dst, s.payload), nil
+}
+
+// stubTUIReceiver is a minimal tuiReceiver for exercising the
+// keybind / control path without an open device.
+type stubTUIReceiver struct {
+	stubRawSampler
+
+	lna, mixer, vga uint8
+	lnaCalls        int
+	mixerCalls      int
+	vgaCalls        int
+	biasOn          bool
+	biasCalls       int
+	forceSetErr     error
+}
+
+func (s *stubTUIReceiver) SetLNAGain(step uint8) error {
+	s.lna = step
+	s.lnaCalls++
+
+	return s.forceSetErr
+}
+
+func (s *stubTUIReceiver) SetMixerGain(step uint8) error {
+	s.mixer = step
+	s.mixerCalls++
+
+	return s.forceSetErr
+}
+
+func (s *stubTUIReceiver) SetVGAGain(step uint8) error {
+	s.vga = step
+	s.vgaCalls++
+
+	return s.forceSetErr
+}
+
+func (s *stubTUIReceiver) SetBiasTee(enable bool) error {
+	s.biasOn = enable
+	s.biasCalls++
+
+	return s.forceSetErr
+}
+
+func TestHandleGainKeyLNAUpDown(t *testing.T) {
+	t.Parallel()
+
+	rcv := &stubTUIReceiver{}
+	model := &tuiModel{
+		history: make([]rtl2832u.SampleStats, 0, tuiHistoryWindow),
+		gain:    gainState{lnaStep: 5, mixerStep: 10, vgaStep: 12},
+	}
+
+	if !handleGainKey(rcv, model, 'l') {
+		t.Fatal("'l' key was not consumed")
+	}
+
+	if rcv.lna != 6 || rcv.lnaCalls != 1 {
+		t.Errorf("after 'l': lna=%d calls=%d, want 6 / 1", rcv.lna, rcv.lnaCalls)
+	}
+
+	if !handleGainKey(rcv, model, 'L') {
+		t.Fatal("'L' key was not consumed")
+	}
+
+	if rcv.lna != 5 {
+		t.Errorf("after 'L' from 6: lna=%d, want 5", rcv.lna)
+	}
+}
+
+func TestHandleGainKeyClampsAtBounds(t *testing.T) {
+	t.Parallel()
+
+	rcv := &stubTUIReceiver{}
+	model := &tuiModel{
+		history: make([]rtl2832u.SampleStats, 0, tuiHistoryWindow),
+		gain:    gainState{lnaStep: 0},
+	}
+
+	// Walk down from 0 should stay at 0 (no uint8 underflow).
+	handleGainKey(rcv, model, 'L')
+
+	if got := model.snapshot().gain.lnaStep; got != 0 {
+		t.Errorf("LNA underflow not clamped: got %d, want 0", got)
+	}
+
+	// Walk up past max should stay at maxR860Step.
+	model.setGain(gainState{lnaStep: maxR860Step})
+	handleGainKey(rcv, model, 'l')
+
+	if got := model.snapshot().gain.lnaStep; got != maxR860Step {
+		t.Errorf("LNA overflow not clamped: got %d, want %d", got, maxR860Step)
+	}
+}
+
+func TestHandleGainKeyBiasTeeToggles(t *testing.T) {
+	t.Parallel()
+
+	rcv := &stubTUIReceiver{}
+	model := &tuiModel{
+		history: make([]rtl2832u.SampleStats, 0, tuiHistoryWindow),
+	}
+
+	handleGainKey(rcv, model, 'b')
+
+	if !rcv.biasOn || !model.snapshot().gain.biasOn {
+		t.Error("first 'b' did not turn bias on")
+	}
+
+	handleGainKey(rcv, model, 'b')
+
+	if rcv.biasOn || model.snapshot().gain.biasOn {
+		t.Error("second 'b' did not turn bias off")
+	}
+}
+
+func TestHandleGainKeyUnrelatedKeyNotConsumed(t *testing.T) {
+	t.Parallel()
+
+	rcv := &stubTUIReceiver{}
+	model := &tuiModel{history: make([]rtl2832u.SampleStats, 0, tuiHistoryWindow)}
+
+	if handleGainKey(rcv, model, 'x') {
+		t.Error("unrelated key 'x' was consumed, want false")
+	}
+
+	if rcv.lnaCalls+rcv.mixerCalls+rcv.vgaCalls+rcv.biasCalls != 0 {
+		t.Error("unrelated key triggered receiver call")
+	}
+}
+
+func TestHandleGainKeyRecordsError(t *testing.T) {
+	t.Parallel()
+
+	rcv := &stubTUIReceiver{forceSetErr: errTUITest}
+	model := &tuiModel{
+		history: make([]rtl2832u.SampleStats, 0, tuiHistoryWindow),
+	}
+
+	handleGainKey(rcv, model, 'l')
+
+	snap := model.snapshot()
+	if !errors.Is(snap.lastControlErr, errTUITest) {
+		t.Errorf("control error not recorded: got %v, want %v", snap.lastControlErr, errTUITest)
+	}
 }

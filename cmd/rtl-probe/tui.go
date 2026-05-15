@@ -58,10 +58,36 @@ type rawSampler interface {
 	Read(ctx context.Context, p []byte) (int, error)
 }
 
+// tuiReceiver groups the receiver slice the TUI needs:
+// rawSampler for the streaming goroutine plus the runtime
+// reconfigure methods the keybind handler drives. Defined as a
+// small interface so the TUI is testable without an open device.
+type tuiReceiver interface {
+	rawSampler
+
+	SetLNAGain(step uint8) error
+	SetMixerGain(step uint8) error
+	SetVGAGain(step uint8) error
+	SetBiasTee(enable bool) error
+}
+
+// gainState mirrors the runtime-controlled gain config the
+// operator can adjust live from the TUI. Used for rendering the
+// current state in the footer; the receiver is the source of
+// truth — these fields track what we *asked for*, not necessarily
+// what the chip ended up at after clamping.
+type gainState struct {
+	lnaStep   uint8
+	mixerStep uint8
+	vgaStep   uint8
+	biasOn    bool
+}
+
 // tuiModel holds the latest sample-stats reading plus a ring
 // buffer of recent ones for the strip chart. Accessed from both
-// the sampling goroutine (writer) and the UI thread (reader), so
-// every field is guarded by mu.
+// the sampling goroutine (writer), the input-capture handler
+// (writer for gain), and the UI thread (reader), so every field
+// is guarded by mu.
 type tuiModel struct {
 	mu             sync.RWMutex
 	latest         rtl2832u.SampleStats
@@ -69,6 +95,8 @@ type tuiModel struct {
 	history        []rtl2832u.SampleStats // ring buffer, len ≤ tuiHistoryWindow
 	frames         uint64
 	lastErr        error
+	gain           gainState
+	lastControlErr error
 }
 
 // tuiSnapshot is the value-copy of tuiModel state taken under a
@@ -80,6 +108,8 @@ type tuiSnapshot struct {
 	history        []rtl2832u.SampleStats
 	frames         uint64
 	lastErr        error
+	gain           gainState
+	lastControlErr error
 }
 
 // update is called by the sampler goroutine each time a fresh
@@ -132,7 +162,32 @@ func (m *tuiModel) snapshot() tuiSnapshot {
 		history:        history,
 		frames:         m.frames,
 		lastErr:        m.lastErr,
+		gain:           m.gain,
+		lastControlErr: m.lastControlErr,
 	}
+}
+
+// setGain replaces the model's tracked gain state under the
+// write lock. Called by the keybind handler after a successful
+// receiver.SetXxx call so the rendered footer matches what the
+// chip is actually programmed to.
+func (m *tuiModel) setGain(state gainState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.gain = state
+	m.lastControlErr = nil
+}
+
+// recordControlError stores the last error from a runtime
+// reconfiguration call (SetLNAGain, SetBiasTee, etc.) so the
+// footer can surface it. The error is only sticky until the next
+// successful control op clears it via setGain.
+func (m *tuiModel) recordControlError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.lastControlErr = err
 }
 
 // runTUI opens the device with the configured options, launches a
@@ -140,9 +195,18 @@ func (m *tuiModel) snapshot() tuiSnapshot {
 // spectrum view until the user quits or ctx is cancelled. Returns
 // exitOK on clean shutdown or exitProbeFailed if the tview app
 // fails to start.
-func runTUI(ctx context.Context, rcv rawSampler, sampleRateHz uint32, stderr io.Writer) int {
+//
+// rcv must support both Read (for the sampler) and the Set*
+// methods (for the keybind-driven runtime gain controls).
+func runTUI(ctx context.Context, rcv tuiReceiver, sampleRateHz uint32, stderr io.Writer) int {
 	model := &tuiModel{
 		history: make([]rtl2832u.SampleStats, 0, tuiHistoryWindow),
+		// Initial gain state mirrors auto-tune's post-converge
+		// posture (all stages at max). It may not match the
+		// actual chip if the operator opened with explicit
+		// per-stage gains; pressing any control key
+		// re-synchronises to a known state.
+		gain: gainState{lnaStep: maxR860Step, mixerStep: maxR860Step, vgaStep: maxR860Step},
 	}
 
 	app := tview.NewApplication()
@@ -176,7 +240,7 @@ func runTUI(ctx context.Context, rcv rawSampler, sampleRateHz uint32, stderr io.
 		AddItem(body, 0, 1, false).
 		AddItem(footer, 1, 0, false)
 
-	app.SetRoot(root, true).SetInputCapture(tuiInputCapture(app))
+	app.SetRoot(root, true).SetInputCapture(tuiInputCapture(app, rcv, model))
 
 	samplerCtx, cancelSampler := context.WithCancel(ctx)
 	defer cancelSampler()
@@ -201,10 +265,22 @@ func runTUI(ctx context.Context, rcv rawSampler, sampleRateHz uint32, stderr io.
 	return exitOK
 }
 
-// tuiInputCapture returns the keypress handler: q or Ctrl-C stops
-// the app, every other key passes through to the focused primitive
-// (currently none — the TUI is read-only).
-func tuiInputCapture(app *tview.Application) func(*tcell.EventKey) *tcell.EventKey {
+// tuiInputCapture returns the keypress handler. Two responsibilities:
+//
+//   - quit on q / Esc / Ctrl-C
+//   - drive the runtime gain controls (l/L LNA, m/M Mixer, v/V VGA,
+//     b bias-tee) on the open receiver, updating model state so
+//     the footer reflects the new configuration.
+//
+// All control writes go through the receiver synchronously from
+// the input goroutine. The library guarantees Set* is safe to
+// call while bulk reads are in flight (separate USB endpoint),
+// so we don't have to coordinate with the sampler goroutine.
+func tuiInputCapture(
+	app *tview.Application,
+	rcv tuiReceiver,
+	model *tuiModel,
+) func(*tcell.EventKey) *tcell.EventKey {
 	return func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyCtrlC || event.Key() == tcell.KeyEsc {
 			app.Stop()
@@ -212,14 +288,96 @@ func tuiInputCapture(app *tview.Application) func(*tcell.EventKey) *tcell.EventK
 			return nil
 		}
 
-		if event.Rune() == 'q' || event.Rune() == 'Q' {
+		if key := event.Rune(); key == 'q' || key == 'Q' {
 			app.Stop()
 
 			return nil
 		}
 
+		if handleGainKey(rcv, model, event.Rune()) {
+			return nil
+		}
+
 		return event
 	}
+}
+
+// maxR860Step is the topmost ladder step the R860 tuner exposes
+// for each gain stage. Used as both the upper clamp for the
+// runtime keybind walks and the assumed post-auto-tune initial
+// state for the rendered footer.
+const maxR860Step = 15
+
+// handleGainKey applies a runtime-control keypress to the
+// receiver and the model. Returns true if the key was consumed.
+//
+// Bindings:
+//
+//	l / L : LNA   step up / down
+//	m / M : Mixer step up / down
+//	v / V : VGA   step up / down
+//	b / B : toggle bias-tee
+//
+// Errors from the receiver are surfaced via the footer through
+// model.recordControlError so the operator sees what failed
+// without losing the rest of the TUI.
+func handleGainKey(rcv tuiReceiver, model *tuiModel, key rune) bool {
+	current := model.snapshot().gain
+	next := current
+
+	var err error
+
+	switch key {
+	case 'l':
+		next.lnaStep = clampStep(int(current.lnaStep) + 1)
+		err = rcv.SetLNAGain(next.lnaStep)
+	case 'L':
+		next.lnaStep = clampStep(int(current.lnaStep) - 1)
+		err = rcv.SetLNAGain(next.lnaStep)
+	case 'm':
+		next.mixerStep = clampStep(int(current.mixerStep) + 1)
+		err = rcv.SetMixerGain(next.mixerStep)
+	case 'M':
+		next.mixerStep = clampStep(int(current.mixerStep) - 1)
+		err = rcv.SetMixerGain(next.mixerStep)
+	case 'v':
+		next.vgaStep = clampStep(int(current.vgaStep) + 1)
+		err = rcv.SetVGAGain(next.vgaStep)
+	case 'V':
+		next.vgaStep = clampStep(int(current.vgaStep) - 1)
+		err = rcv.SetVGAGain(next.vgaStep)
+	case 'b', 'B':
+		next.biasOn = !current.biasOn
+		err = rcv.SetBiasTee(next.biasOn)
+	default:
+		return false
+	}
+
+	if err != nil {
+		model.recordControlError(err)
+
+		return true
+	}
+
+	model.setGain(next)
+
+	return true
+}
+
+// clampStep bounds an arithmetic step adjustment to the valid
+// R860 ladder range [0, maxR860Step]. Used by the keybind handler
+// so walking past the ends becomes a no-op rather than wrapping
+// around (uint8 underflow would jump 0 → 255 → tuner-clamp).
+func clampStep(step int) uint8 {
+	if step < 0 {
+		return 0
+	}
+
+	if step > maxR860Step {
+		return maxR860Step
+	}
+
+	return uint8(step) //nolint:gosec // bounded by the clauses above.
 }
 
 // runSampler is the goroutine that pulls raw I/Q chunks from the
@@ -389,7 +547,7 @@ func runRedraw(
 			panes.histogram.SetText(renderHistogram(snap.latest.MagnitudeHistogram, histW, histH))
 			panes.strip.SetText(renderStripChart(snap.history, stripW, stripH))
 			panes.spectrum.SetText(renderSpectrum(snap.latestSpectrum, displayTop, baselineDB, specW, specH))
-			panes.footer.SetText(renderFooter(snap.lastErr))
+			panes.footer.SetText(renderFooter(snap.gain, snap.lastErr, snap.lastControlErr))
 		})
 	}
 }
@@ -411,14 +569,38 @@ func renderHeader(stats rtl2832u.SampleStats, frames uint64) string {
 	)
 }
 
-// renderFooter draws the keybindings line and any sampler error.
-// Errors are coloured red so a hung USB shows up at a glance.
-func renderFooter(lastErr error) string {
-	if lastErr != nil {
-		return fmt.Sprintf("[red]sampler error: %v[-] · [::b]q[::-] quit", lastErr)
+// renderFooter draws the gain-control state, keybindings line,
+// and any sampler / control error. Errors are coloured red so a
+// hung USB or rejected gain write shows up at a glance.
+func renderFooter(state gainState, samplerErr, controlErr error) string {
+	gain := fmt.Sprintf(
+		"LNA=%d Mix=%d VGA=%d bias=%s",
+		state.lnaStep, state.mixerStep, state.vgaStep, biasLabel(state.biasOn),
+	)
+
+	switch {
+	case samplerErr != nil:
+		return fmt.Sprintf("[red]sampler error: %v[-]  ·  %s  ·  [::b]q[::-] quit", samplerErr, gain)
+	case controlErr != nil:
+		return fmt.Sprintf("%s  ·  [red]last control: %v[-]  ·  [::b]q[::-] quit", gain, controlErr)
+	default:
+		return gain + "  ·  [::b]l[::-]/[::b]L[::-] LNA  [::b]m[::-]/[::b]M[::-] Mix  " +
+			"[::b]v[::-]/[::b]V[::-] VGA  [::b]b[::-] bias  ·  [::b]q[::-] quit"
+	}
+}
+
+// biasLabel renders the bias-tee state as the on/off token the
+// footer shows. Pulled out so the format is consistent with
+// whatever other surfaces (logs, status banners) want to render
+// it later.
+//
+//nolint:revive // boolean state→string mapping is the exact intent here.
+func biasLabel(enabled bool) string {
+	if enabled {
+		return "on"
 	}
 
-	return "[::b]q[::-] quit · [::b]esc[::-] quit · live histogram + strip chart at ~5 Hz"
+	return "off"
 }
 
 // histogramBlocks is the eight-level vertical block ramp used to

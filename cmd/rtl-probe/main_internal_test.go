@@ -25,6 +25,19 @@ type fakeReceiver struct {
 	statsCalls  int
 	closeFn     func() error
 	closed      int
+
+	lastLNAStep    uint8
+	lnaCalls       int
+	setLNAErr      error
+	lastMixerStep  uint8
+	mixerCalls     int
+	setMixerErr    error
+	lastVGAStep    uint8
+	vgaCalls       int
+	setVGAErr      error
+	lastBiasEnable bool
+	biasCalls      int
+	setBiasErr     error
 }
 
 type fakeRead struct {
@@ -67,6 +80,34 @@ func (f *fakeReceiver) ReadSampleStats(_ context.Context, _ int) (rtl2832u.Sampl
 	f.statsCalls++
 
 	return f.statsResult, f.statsErr
+}
+
+func (f *fakeReceiver) SetLNAGain(step uint8) error {
+	f.lastLNAStep = step
+	f.lnaCalls++
+
+	return f.setLNAErr
+}
+
+func (f *fakeReceiver) SetMixerGain(step uint8) error {
+	f.lastMixerStep = step
+	f.mixerCalls++
+
+	return f.setMixerErr
+}
+
+func (f *fakeReceiver) SetVGAGain(step uint8) error {
+	f.lastVGAStep = step
+	f.vgaCalls++
+
+	return f.setVGAErr
+}
+
+func (f *fakeReceiver) SetBiasTee(enable bool) error {
+	f.lastBiasEnable = enable
+	f.biasCalls++
+
+	return f.setBiasErr
 }
 
 func (f *fakeReceiver) Close() error {
