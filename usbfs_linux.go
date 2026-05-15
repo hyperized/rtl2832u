@@ -230,16 +230,27 @@ func selectDevice(cfg config, root string) (usbDevice, error) {
 // claimUSBDevice opens the dongle's /dev/bus/usb/... node and
 // claims its interface 0. On claim failure the file descriptor is
 // closed so the kernel doesn't keep the device pinned.
+//
+// First attempt is USBDEVFS_DISCONNECT_CLAIM (kernel ≥ 3.18),
+// which atomically evicts any in-kernel driver (typically
+// dvb_usb_rtl28xxu, which auto-binds to RTL-SDR dongles) and
+// claims the interface for our fd in a single ioctl. Falls back
+// to bare USBDEVFS_CLAIMINTERFACE on ancient kernels — there the
+// operator still has to unbind the kernel driver by hand.
 func claimUSBDevice(usb usbDevice) (*os.File, error) {
 	device, err := os.OpenFile(usb.devNode, os.O_RDWR, 0)
 	if err != nil {
 		return nil, wrapOpenError(usb.devNode, err)
 	}
 
-	if err := claimInterface(device, 0); err != nil {
+	err = disconnectKernelAndClaim(device, 0)
+	if errors.Is(err, errKernelDetachUnsupported) {
+		err = claimInterface(device, 0)
+	}
+
+	if err != nil {
 		// Roll back the open: leaving the fd around would leak a kernel
-		// handle if the kernel rejected the claim (e.g. the
-		// dvb_usb_rtl28xxu driver still has the interface).
+		// handle if the kernel rejected the claim.
 		_ = device.Close()
 
 		return nil, wrapClaimError(usb, err)
@@ -414,18 +425,21 @@ func wrapOpenError(devNode string, err error) error {
 	}
 }
 
-// wrapClaimError translates a USBDEVFS_CLAIMINTERFACE failure into a
-// message that names the most likely fix. EBUSY is the dominant
-// cause: the kernel's dvb_usb_rtl28xxu driver auto-binds to RTL-SDR
-// dongles and holds the interface.
+// wrapClaimError translates a USBDEVFS_DISCONNECT_CLAIM (or
+// fallback CLAIMINTERFACE) failure into a message that names the
+// most likely fix. EBUSY post-auto-detach usually means another
+// userspace process already has the interface claimed (a stale
+// readsb / dump1090 / rtl_tcp); on pre-3.18 kernels the fallback
+// path can still surface the legacy "kernel driver holds the
+// interface" cause, and the unbind hint stays useful there.
 func wrapClaimError(usb usbDevice, err error) error {
 	if errors.Is(err, syscall.EBUSY) {
 		return fmt.Errorf(
 			"sdr: claim interface 0 on %s: device busy "+
-				"(unbind the kernel driver: "+
-				"`echo %d-%d | sudo tee /sys/bus/usb/drivers/dvb_usb_rtl28xxu/unbind` "+
-				"or blacklist it via `echo blacklist dvb_usb_rtl28xxu >> /etc/modprobe.d/blacklist-rtl.conf`): %w",
-			usb.devNode, usb.busNum, usb.devNum, err)
+				"(another userspace process likely has it — `lsof %s` / `fuser %s`; "+
+				"on kernels < 3.18 also unbind dvb_usb_rtl28xxu: "+
+				"`echo %d-%d | sudo tee /sys/bus/usb/drivers/dvb_usb_rtl28xxu/unbind`): %w",
+			usb.devNode, usb.devNode, usb.devNode, usb.busNum, usb.devNum, err)
 	}
 
 	return fmt.Errorf("sdr: claim interface 0 on %s: %w", usb.devNode, err)
