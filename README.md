@@ -109,7 +109,10 @@ Three stages on the R820T / R860 tuner: LNA, post-mixer amp, VGA. Pin individual
 
 | | |
 |---|---|
-| `Receiver.SignalStats() (SignalStats, error)` | Point-in-time read of the chip's `if_agc_val` / `rf_agc_val` / `aagc_lock` (RTL2832U §8.1.5). Drives auto-tune and is useful as a chain-quality probe. |
+| `Receiver.ReadSampleStats(ctx, targetSamples) (SampleStats, error)` | Reads `targetSamples` I/Q pairs and returns host-side magnitude statistics: RMS, peak, saturation fraction, DC offsets, and a 64-bucket magnitude histogram. Primary chain-quality probe. Works on all tuners — computed from the bulk endpoint, independent of the chip's AGC state. |
+| `ComputeSampleStats(raw []byte) SampleStats` | Pure-function variant: when the caller already has the raw I/Q bytes in hand (replay mode, shared buffers feeding an FFT, etc.) and wants the stats without going through a Read pass. |
+| `Receiver.SignalStats() (SignalStats, error)` | Point-in-time read of the chip's `if_agc_val` / `rf_agc_val` / `aagc_lock` (RTL2832U §8.1.5). Note: on the R820T2 path the demod-side RF/IF AGC loops are intentionally disabled to avoid a feedback fight with the tuner's VGA, so these register values are effectively static — use `ReadSampleStats` instead for diagnostics on that tuner. |
+| `Receiver.AutoTuneGain(ctx, opts) (AutoTuneResult, error)` | Closed-loop gain search at Open time. Pins Mixer + VGA at max, walks LNA down until `SampleStats.SaturationFrac` drops below the threshold (default 2 %, sized to ADS-B's burst statistics). |
 | `Receiver.DroppedSampleChunks() uint64` | Cumulative count of sample chunks the URB ring had to discard because the consumer fell behind. A non-zero value over a long-running session means the demod is slower than the configured sample rate. |
 | `WithBiasTee(enable bool)` | Toggles GPIO0 to switch the dongle's 4.5 V bias-tee output. Powers external active LNAs and SAW filters from the antenna coax on V3-class dongles. |
 | `WithBiasTeeGPIO(gpio uint8, enable bool)` | Escape hatch for clones with non-standard bias-tee wiring. |
@@ -146,6 +149,52 @@ The package splits naturally along the two physical chips:
 The chip driver (`rtl2832u`) only knows about baseband. Any front-end mixer that implements `Tuner` — `SetFreq`, the three `SetXGain` methods, the IF-filter trio — slots in without changes elsewhere. Today only R820T / R860 ships; the abstraction makes adding more straightforward.
 
 The chip exposes its I²C bus to the tuner through a `repeater` register, encapsulated as `i2cTransport`. Tuners are written against that interface so they can be unit-tested with a small mock instead of booting the whole stack.
+
+## Operator tool: `rtl-probe`
+
+`cmd/rtl-probe` is a small CLI that ships alongside the library. Three modes, all routed through the same opener so the flag plumbing is shared:
+
+```sh
+# one-shot stats line (legacy, fast)
+rtl-probe --probe-bytes 65536
+
+# IQ capture (rtl_sdr / dump1090 --ifile compatible)
+rtl-probe --capture cap.iq --capture-bytes $((2*1024*1024))
+
+# interactive TUI: live histogram + strip chart + spectrum
+rtl-probe --tui
+```
+
+The `--tui` mode opens a tview UI driven by a sampling goroutine that pulls raw I/Q chunks (~5 Hz) and derives both `SampleStats` and an FFT spectrum from the same buffer:
+
+```
+┌─ header: live samples / RMS / peak / sat % / DC values ─────────────────┐
+├─ status: smoothed GOOD / MARGINAL / BAD with offender labels ───────────┤
+├─ advice: actionable hints ("reduce gain", "DC offset large", …) ────────┤
+├──────────────────────────────────┬──────────────────────────────────────┤
+│ ┌─ magnitude histogram ────────┐ │ ┌─ strip chart (last ~30 s) ───────┐ │
+│ │ colour by X-axis position:   │ │ │ rms / sat / peak / dcI / dcQ as  │ │
+│ │  red < 12 mag (under-gained) │ │ │ block-char traces; each cell     │ │
+│ │  green 25–130 (healthy)      │ │ │ colour-coded by per-series grade │ │
+│ │  red > 160 mag (clipping)    │ │ └──────────────────────────────────┘ │
+│ │ y-axis: % of max bucket      │ │ ┌─ spectrum (~54 ms Welch average) ┐ │
+│ │ x-axis: 0..181 |I+jQ|        │ │ │ row-coloured (VU-meter style),   │ │
+│ └──────────────────────────────┘ │ │ baseline ╌╌ at long-term floor,  │ │
+│                                  │ │ │ at carrier, ▲ on the axis     │ │
+│                                  │ └──────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────────┤
+└─ footer: q quit · esc quit · last sampler error if any ─────────────────┘
+```
+
+Key design choices:
+
+- **Welch averaging in the spectrum**: each frame runs ~256 short FFTs over the 128 KiB sample window (50 % overlap, Hann window) and averages in the power domain before converting to dB. Stable noise floor; bursts don't dominate single frames.
+- **Slow-decay scale tracker**: the spectrum's Y-axis top snaps up to new peaks immediately but decays at 5 dB/s — the chart doesn't constantly rescale on transient signals.
+- **Long-term baseline tracker**: a 30 s EMA of the 25th-percentile bin, drawn as a horizontal dashed line. Anything sticking up above the line is signal worth attention.
+- **Carrier marker `│`**: a vertical guide through the chart at the tuned-frequency column, plus a `▲` on the X-axis. Visual anchor for "is the peak where I tuned?".
+- **Status / advice debounce**: both banners read from a 20-frame trailing average so they don't flicker on bursty traffic.
+
+The TUI is built on `github.com/rivo/tview` + `github.com/gdamore/tcell` — pulled in only by `cmd/rtl-probe`, so library consumers (e.g. downstream demodulators) don't transitively depend on them.
 
 ## Hardware target
 

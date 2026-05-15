@@ -90,6 +90,7 @@ type config struct {
 	captureBytes int
 
 	skipProbe bool
+	tui       bool
 }
 
 // biasTeeUnset is the sentinel for --bias-tee meaning "leave the
@@ -139,6 +140,10 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 		"number of IQ bytes to capture when --capture is set; rounded up to a 32 KiB multiple internally")
 	flagSet.BoolVar(&cfg.skipProbe, "no-probe", false,
 		"skip the AGC SignalStats probe; useful when you only want a capture")
+	flagSet.BoolVar(&cfg.tui, "tui", false,
+		"open a live magnitude-histogram + strip-chart TUI instead of running the "+
+			"one-shot probe/capture. Useful for diagnosing gain regime and chain stability "+
+			"interactively. q or Esc quits.")
 
 	if err := flagSet.Parse(args); err != nil {
 		return cfg, fmt.Errorf("flag parse: %w", err)
@@ -155,6 +160,7 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 // without opening real silicon.
 type receiver interface {
 	Read(ctx context.Context, p []byte) (int, error)
+	ReadSampleStats(ctx context.Context, targetSamples int) (rtl2832u.SampleStats, error)
 	Close() error
 }
 
@@ -272,6 +278,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, open open
 	_, _ = fmt.Fprintf(stderr,
 		"rtl-probe: opened device=%d center=%d Hz rate=%d Hz ppm=%d\n",
 		cfg.deviceIndex, cfg.centerFreqHz, cfg.sampleRateHz, cfg.freqCorrectionPPM)
+
+	if cfg.tui {
+		return runTUI(ctx, rcv, cfg.sampleRateHz, stderr)
+	}
 
 	if !cfg.skipProbe {
 		if rc := probeIQ(ctx, rcv, cfg, stderr); rc != exitOK {

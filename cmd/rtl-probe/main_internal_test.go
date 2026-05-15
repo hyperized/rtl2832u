@@ -19,9 +19,12 @@ import (
 // closeFn hook lets tests assert behaviour around Close errors
 // without spawning real silicon.
 type fakeReceiver struct {
-	reads   []fakeRead
-	closeFn func() error
-	closed  int
+	reads       []fakeRead
+	statsResult rtl2832u.SampleStats
+	statsErr    error
+	statsCalls  int
+	closeFn     func() error
+	closed      int
 }
 
 type fakeRead struct {
@@ -58,6 +61,12 @@ func (f *fakeReceiver) Read(_ context.Context, dst []byte) (int, error) {
 	}
 
 	return copy(dst, next.data), nil
+}
+
+func (f *fakeReceiver) ReadSampleStats(_ context.Context, _ int) (rtl2832u.SampleStats, error) {
+	f.statsCalls++
+
+	return f.statsResult, f.statsErr
 }
 
 func (f *fakeReceiver) Close() error {
