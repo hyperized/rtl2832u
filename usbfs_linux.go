@@ -87,6 +87,13 @@ type linuxBackend struct {
 	dev   *os.File
 	iface uint32
 
+	// biasTeeGPIO remembers which GPIO line the Open-time bias-tee
+	// config used (or the default 0 when the operator never
+	// passed --bias-tee). Receiver.SetBiasTee at runtime reuses
+	// this so callers don't have to re-specify the GPIO each
+	// time they toggle.
+	biasTeeGPIO uint8
+
 	// chip is retained so post-Open methods (SignalStats,
 	// AutoTuneGain, runtime register reads) can drive the same
 	// controller that opened the device. The chip's `ctrl` field
@@ -144,7 +151,12 @@ func openBackendWithSysfs(cfg config, root string) (backend, error) {
 		return nil, err
 	}
 
-	back := &linuxBackend{dev: device, iface: 0, logger: cfg.logger}
+	back := &linuxBackend{
+		dev:         device,
+		iface:       0,
+		biasTeeGPIO: cfg.biasTee.gpio,
+		logger:      cfg.logger,
+	}
 	back.chip = newRTL2832U(back)
 
 	if err := configureChipAndTuner(cfg, usb, back); err != nil {
@@ -599,4 +611,47 @@ func (b *linuxBackend) SignalStats() (SignalStats, error) {
 // retained tuner and the bulk-endpoint sample stream.
 func (b *linuxBackend) AutoTuneGain(ctx context.Context, opts AutoTuneOptions) (AutoTuneResult, error) {
 	return autoTuneGain(ctx, b.tuner, b, opts)
+}
+
+// SetLNAGain reconfigures the tuner's LNA stage at runtime. Safe
+// to call while bulk reads are in flight — the write is a USB
+// control transfer on the I²C side, separate from the bulk
+// endpoint the URB ring drives. step is clamped by the tuner's
+// own validation.
+func (b *linuxBackend) SetLNAGain(step uint8) error {
+	if err := b.tuner.SetLNAGain(ManualGainStep(step)); err != nil {
+		return fmt.Errorf("rtl2832u: set LNA gain: %w", err)
+	}
+
+	return nil
+}
+
+// SetMixerGain reconfigures the tuner's Mixer stage at runtime.
+// Same safety / clamping notes as SetLNAGain.
+func (b *linuxBackend) SetMixerGain(step uint8) error {
+	if err := b.tuner.SetMixerGain(ManualGainStep(step)); err != nil {
+		return fmt.Errorf("rtl2832u: set Mixer gain: %w", err)
+	}
+
+	return nil
+}
+
+// SetVGAGain reconfigures the tuner's VGA stage at runtime. Same
+// safety / clamping notes as SetLNAGain.
+func (b *linuxBackend) SetVGAGain(step uint8) error {
+	if err := b.tuner.SetVGAGain(ManualGainStep(step)); err != nil {
+		return fmt.Errorf("rtl2832u: set VGA gain: %w", err)
+	}
+
+	return nil
+}
+
+// SetBiasTee toggles the bias-tee GPIO at runtime, reusing the
+// GPIO line the Open-time config selected (default 0).
+func (b *linuxBackend) SetBiasTee(enable bool) error {
+	if err := b.chip.setBiasTee(b.biasTeeGPIO, enable); err != nil {
+		return fmt.Errorf("rtl2832u: set bias-tee: %w", err)
+	}
+
+	return nil
 }

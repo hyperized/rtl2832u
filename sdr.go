@@ -441,6 +441,10 @@ type backend interface {
 	DroppedSampleChunks() uint64
 	SignalStats() (SignalStats, error)
 	AutoTuneGain(ctx context.Context, opts AutoTuneOptions) (AutoTuneResult, error)
+	SetLNAGain(step uint8) error
+	SetMixerGain(step uint8) error
+	SetVGAGain(step uint8) error
+	SetBiasTee(enable bool) error
 }
 
 // Open enumerates RTL-SDR devices and opens the one at the configured
@@ -547,4 +551,55 @@ func (r *Receiver) AutoTuneGain(ctx context.Context, opts AutoTuneOptions) (Auto
 	}
 
 	return result, nil
+}
+
+// SetLNAGain reconfigures the tuner's LNA gain stage at runtime
+// to the supplied step (0..15, R860 ladder). Safe to call while
+// sample streaming is in progress — the write goes through a USB
+// control transfer on the I²C path, separate from the bulk
+// endpoint the URB ring uses. Values outside 0..15 are clamped
+// by the tuner.
+//
+// Useful for interactive tuning: an operator UI can rebind keys
+// to walk the LNA step up/down and observe the SampleStats /
+// spectrum response live. The change takes effect on the next
+// I/Q chunk that arrives; on the R820T2 the tuner's own settle
+// time is well under one URB period.
+func (r *Receiver) SetLNAGain(step uint8) error {
+	if err := r.backend.SetLNAGain(step); err != nil {
+		return fmt.Errorf("rtl2832u: set LNA gain: %w", err)
+	}
+
+	return nil
+}
+
+// SetMixerGain reconfigures the tuner's Mixer gain stage at
+// runtime. Same safety / clamping notes as SetLNAGain.
+func (r *Receiver) SetMixerGain(step uint8) error {
+	if err := r.backend.SetMixerGain(step); err != nil {
+		return fmt.Errorf("rtl2832u: set Mixer gain: %w", err)
+	}
+
+	return nil
+}
+
+// SetVGAGain reconfigures the tuner's VGA gain stage at runtime.
+// Same safety / clamping notes as SetLNAGain.
+func (r *Receiver) SetVGAGain(step uint8) error {
+	if err := r.backend.SetVGAGain(step); err != nil {
+		return fmt.Errorf("rtl2832u: set VGA gain: %w", err)
+	}
+
+	return nil
+}
+
+// SetBiasTee toggles the dongle's bias-tee GPIO at runtime,
+// reusing the GPIO line selected at Open time (default 0). Safe
+// to call while sample streaming is in progress.
+func (r *Receiver) SetBiasTee(enable bool) error {
+	if err := r.backend.SetBiasTee(enable); err != nil {
+		return fmt.Errorf("rtl2832u: set bias-tee: %w", err)
+	}
+
+	return nil
 }

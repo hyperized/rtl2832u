@@ -792,6 +792,19 @@ type fakeBackend struct {
 	statsErr    error
 	tuneResult  AutoTuneResult
 	tuneErr     error
+
+	lastLNAStep    uint8
+	lnaCalls       int
+	setLNAErr      error
+	lastMixerStep  uint8
+	mixerCalls     int
+	setMixerErr    error
+	lastVGAStep    uint8
+	vgaCalls       int
+	setVGAErr      error
+	lastBiasEnable bool
+	biasCalls      int
+	setBiasErr     error
 }
 
 func (f *fakeBackend) Read(_ context.Context, _ []byte) (int, error) {
@@ -814,6 +827,34 @@ func (f *fakeBackend) SignalStats() (SignalStats, error) {
 
 func (f *fakeBackend) AutoTuneGain(_ context.Context, _ AutoTuneOptions) (AutoTuneResult, error) {
 	return f.tuneResult, f.tuneErr
+}
+
+func (f *fakeBackend) SetLNAGain(step uint8) error {
+	f.lastLNAStep = step
+	f.lnaCalls++
+
+	return f.setLNAErr
+}
+
+func (f *fakeBackend) SetMixerGain(step uint8) error {
+	f.lastMixerStep = step
+	f.mixerCalls++
+
+	return f.setMixerErr
+}
+
+func (f *fakeBackend) SetVGAGain(step uint8) error {
+	f.lastVGAStep = step
+	f.vgaCalls++
+
+	return f.setVGAErr
+}
+
+func (f *fakeBackend) SetBiasTee(enable bool) error {
+	f.lastBiasEnable = enable
+	f.biasCalls++
+
+	return f.setBiasErr
 }
 
 func TestReceiverReadDelegatesToBackend(t *testing.T) {
@@ -959,5 +1000,61 @@ func TestReceiverDroppedSampleChunksDelegates(t *testing.T) {
 
 	if got := rcv.DroppedSampleChunks(); got != 1234 {
 		t.Errorf("DroppedSampleChunks = %d, want 1234", got)
+	}
+}
+
+func TestReceiverSetLNAGainDelegates(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeBackend{}
+	rcv := &Receiver{cfg: defaultConfig(), backend: fake}
+
+	if err := rcv.SetLNAGain(7); err != nil {
+		t.Fatalf("SetLNAGain: %v", err)
+	}
+
+	if fake.lnaCalls != 1 || fake.lastLNAStep != 7 {
+		t.Errorf("backend got calls=%d step=%d, want 1 / 7", fake.lnaCalls, fake.lastLNAStep)
+	}
+}
+
+func TestReceiverSetMixerGainPropagatesError(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeBackend{setMixerErr: errFakeRead}
+	rcv := &Receiver{cfg: defaultConfig(), backend: fake}
+
+	if err := rcv.SetMixerGain(3); !errors.Is(err, errFakeRead) {
+		t.Errorf("err = %v, want wrapping errFakeRead", err)
+	}
+}
+
+func TestReceiverSetVGAGainDelegates(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeBackend{}
+	rcv := &Receiver{cfg: defaultConfig(), backend: fake}
+
+	if err := rcv.SetVGAGain(12); err != nil {
+		t.Fatalf("SetVGAGain: %v", err)
+	}
+
+	if fake.lastVGAStep != 12 {
+		t.Errorf("VGA step = %d, want 12", fake.lastVGAStep)
+	}
+}
+
+func TestReceiverSetBiasTeeDelegates(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeBackend{}
+	rcv := &Receiver{cfg: defaultConfig(), backend: fake}
+
+	if err := rcv.SetBiasTee(true); err != nil {
+		t.Fatalf("SetBiasTee: %v", err)
+	}
+
+	if !fake.lastBiasEnable || fake.biasCalls != 1 {
+		t.Errorf("bias state = %v calls=%d, want true / 1", fake.lastBiasEnable, fake.biasCalls)
 	}
 }
