@@ -83,6 +83,70 @@ type gainState struct {
 	biasOn    bool
 }
 
+// autoTuneStatus tracks whether a TUI-driven auto-tune walk is
+// active. Transitions: idle → running (operator presses 'a') →
+// idle (walk converges, is cancelled, or errors).
+type autoTuneStatus int
+
+const (
+	autoTuneIdle autoTuneStatus = iota
+	autoTuneRunning
+)
+
+// autoTuneState captures the live and terminal state of a TUI-
+// driven auto-tune walk. While running, currentLNA / iterations
+// update each step so the footer reflects progress. After a run
+// completes, finalLNA / finalSat / iterations stay populated and
+// completed flips true so the footer can render a summary the
+// operator can compare against their manual exploration.
+// completedAt records the wall-clock time the last run finished
+// — the footer uses it (against sweepState.completedAt) to pick
+// which summary to show when both have run since startup.
+type autoTuneState struct {
+	status      autoTuneStatus
+	currentLNA  uint8
+	finalLNA    uint8
+	finalSat    float64
+	iterations  int
+	err         error
+	completed   bool
+	completedAt time.Time
+}
+
+// sweepStatus tracks whether a TUI-driven 3D gain sweep is
+// active. Mirrors autoTuneStatus.
+type sweepStatus int
+
+const (
+	sweepIdle sweepStatus = iota
+	sweepRunning
+)
+
+// sweepState captures the live and terminal state of a TUI-
+// driven 3D gain sweep. During a run, current* and cells track
+// progress; total holds the grid size; best* hold the running
+// winner (initialised on the first probed cell). After a run
+// completes, best* / cells stay populated and completed flips
+// true so the footer can render a summary. completedAt is used
+// to disambiguate against autoTuneState when both have run.
+type sweepState struct {
+	status      sweepStatus
+	currentLNA  uint8
+	currentMix  uint8
+	currentVGA  uint8
+	cells       int
+	total       int
+	bestLNA     uint8
+	bestMix     uint8
+	bestVGA     uint8
+	bestRMS     float64
+	bestSat     float64
+	bestKnown   bool
+	err         error
+	completed   bool
+	completedAt time.Time
+}
+
 // tuiModel holds the latest sample-stats reading plus a ring
 // buffer of recent ones for the strip chart. Accessed from both
 // the sampling goroutine (writer), the input-capture handler
@@ -97,6 +161,10 @@ type tuiModel struct {
 	lastErr        error
 	gain           gainState
 	lastControlErr error
+	autoTune       autoTuneState
+	autoTuneCancel context.CancelFunc
+	sweep          sweepState
+	sweepCancel    context.CancelFunc
 }
 
 // tuiSnapshot is the value-copy of tuiModel state taken under a
@@ -110,6 +178,8 @@ type tuiSnapshot struct {
 	lastErr        error
 	gain           gainState
 	lastControlErr error
+	autoTune       autoTuneState
+	sweep          sweepState
 }
 
 // update is called by the sampler goroutine each time a fresh
@@ -164,6 +234,8 @@ func (m *tuiModel) snapshot() tuiSnapshot {
 		lastErr:        m.lastErr,
 		gain:           m.gain,
 		lastControlErr: m.lastControlErr,
+		autoTune:       m.autoTune,
+		sweep:          m.sweep,
 	}
 }
 
@@ -188,6 +260,181 @@ func (m *tuiModel) recordControlError(err error) {
 	defer m.mu.Unlock()
 
 	m.lastControlErr = err
+}
+
+// startAutoTune attempts to mark a new auto-tune run as in
+// progress. Returns the derived context the goroutine should use
+// (cancelled when the parent ctx ends or cancelAutoTune is
+// called) plus a bool reporting whether the run was actually
+// started. Returns (nil, false) when an auto-tune *or* a sweep
+// is already in flight, so callers can interpret a second 'a'
+// press as a cancel request and so the two operations don't
+// race on the gain stages.
+//
+// On start, the previous run's terminal fields (finalLNA / err /
+// completed) are wiped so the footer doesn't blend old and new
+// outcomes.
+func (m *tuiModel) startAutoTune(parent context.Context) (context.Context, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.autoTune.status == autoTuneRunning || m.sweep.status == sweepRunning {
+		return nil, false
+	}
+
+	ctx, cancel := context.WithCancel(parent)
+	m.autoTune = autoTuneState{status: autoTuneRunning}
+	m.autoTuneCancel = cancel
+
+	return ctx, true
+}
+
+// cancelAutoTune signals any in-progress run to wind down. Safe
+// to call when no run is active.
+func (m *tuiModel) cancelAutoTune() {
+	m.mu.Lock()
+	cancel := m.autoTuneCancel
+	m.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// setAutoTuneProgress publishes per-iteration progress so the
+// footer can render "probing LNA=N (step k/16)".
+func (m *tuiModel) setAutoTuneProgress(currentLNA uint8, iterations int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.autoTune.currentLNA = currentLNA
+	m.autoTune.iterations = iterations
+}
+
+// finishAutoTune records a successful convergence. status returns
+// to idle but finalLNA / finalSat / iterations / completed stay
+// populated so the footer can render the summary until the next
+// run starts.
+func (m *tuiModel) finishAutoTune(finalLNA uint8, finalSat float64, iterations int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.autoTune.status = autoTuneIdle
+	m.autoTune.currentLNA = finalLNA
+	m.autoTune.finalLNA = finalLNA
+	m.autoTune.finalSat = finalSat
+	m.autoTune.iterations = iterations
+	m.autoTune.err = nil
+	m.autoTune.completed = true
+	m.autoTune.completedAt = time.Now()
+	m.autoTuneCancel = nil
+}
+
+// failAutoTune records a failed (or cancelled) run so the footer
+// can show the diagnostic. completed stays false so we don't
+// claim a converged result.
+func (m *tuiModel) failAutoTune(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.autoTune.status = autoTuneIdle
+	m.autoTune.err = err
+	m.autoTune.completed = false
+	m.autoTuneCancel = nil
+}
+
+// startSweep is the sweep equivalent of startAutoTune. Refuses to
+// start if either op is already running so the two walkers can't
+// stomp each other's writes to the gain stages.
+func (m *tuiModel) startSweep(parent context.Context) (context.Context, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.sweep.status == sweepRunning || m.autoTune.status == autoTuneRunning {
+		return nil, false
+	}
+
+	ctx, cancel := context.WithCancel(parent)
+	m.sweep = sweepState{status: sweepRunning}
+	m.sweepCancel = cancel
+
+	return ctx, true
+}
+
+// cancelSweep signals any in-progress sweep to wind down. Safe
+// to call when no sweep is active.
+func (m *tuiModel) cancelSweep() {
+	m.mu.Lock()
+	cancel := m.sweepCancel
+	m.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// setSweepTotal publishes the grid size up-front so the footer
+// can render "cell N/total" from the very first iteration.
+func (m *tuiModel) setSweepTotal(total int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.sweep.total = total
+}
+
+// setSweepProgress publishes the cell currently being probed so
+// the footer can render live progress.
+func (m *tuiModel) setSweepProgress(lna, mix, vga uint8, cells int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.sweep.currentLNA = lna
+	m.sweep.currentMix = mix
+	m.sweep.currentVGA = vga
+	m.sweep.cells = cells
+}
+
+// recordSweepBest publishes a new running winner. Called every
+// time runSweep finds a cell that scores better than the current
+// best per isBetterCell, so the operator sees the best-so-far
+// improve in real time.
+func (m *tuiModel) recordSweepBest(cell sweepResult) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.sweep.bestLNA = cell.lna
+	m.sweep.bestMix = cell.mix
+	m.sweep.bestVGA = cell.vga
+	m.sweep.bestRMS = cell.rms
+	m.sweep.bestSat = cell.sat
+	m.sweep.bestKnown = true
+}
+
+// finishSweep marks the sweep as complete and stamps completedAt
+// so renderFooter can pick this summary over any older auto-tune
+// completion. best* are not touched here — they were already
+// populated by recordSweepBest as the walker found improvements.
+func (m *tuiModel) finishSweep() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.sweep.status = sweepIdle
+	m.sweep.err = nil
+	m.sweep.completed = true
+	m.sweep.completedAt = time.Now()
+	m.sweepCancel = nil
+}
+
+// failSweep records a failed (or cancelled) sweep so the footer
+// can show the diagnostic. completed stays false.
+func (m *tuiModel) failSweep(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.sweep.status = sweepIdle
+	m.sweep.err = err
+	m.sweep.completed = false
+	m.sweepCancel = nil
 }
 
 // runTUI opens the device with the configured options, launches a
@@ -240,10 +487,10 @@ func runTUI(ctx context.Context, rcv tuiReceiver, sampleRateHz uint32, stderr io
 		AddItem(body, 0, 1, false).
 		AddItem(footer, 1, 0, false)
 
-	app.SetRoot(root, true).SetInputCapture(tuiInputCapture(app, rcv, model))
-
 	samplerCtx, cancelSampler := context.WithCancel(ctx)
 	defer cancelSampler()
+
+	app.SetRoot(root, true).SetInputCapture(tuiInputCapture(samplerCtx, app, rcv, model))
 
 	go runSampler(samplerCtx, rcv, model)
 	go runRedraw(samplerCtx, app, model, redrawPanes{
@@ -265,18 +512,32 @@ func runTUI(ctx context.Context, rcv tuiReceiver, sampleRateHz uint32, stderr io
 	return exitOK
 }
 
-// tuiInputCapture returns the keypress handler. Two responsibilities:
+// tuiInputCapture returns the keypress handler. Four responsibilities:
 //
 //   - quit on q / Esc / Ctrl-C
 //   - drive the runtime gain controls (l/L LNA, m/M Mixer, v/V VGA,
 //     b bias-tee) on the open receiver, updating model state so
-//     the footer reflects the new configuration.
+//     the footer reflects the new configuration
+//   - start / cancel a TUI-driven gain auto-tune walk on 'a' / 'A'
+//   - start / cancel a TUI-driven 3D gain sweep on 's' / 'S'
+//
+// Manual gain keys are suppressed while either walker is running
+// so the operator's keystrokes don't race the walker's Set*
+// calls. Auto-tune and sweep are also mutually exclusive: each
+// refuses to start while the other is in flight.
 //
 // All control writes go through the receiver synchronously from
 // the input goroutine. The library guarantees Set* is safe to
 // call while bulk reads are in flight (separate USB endpoint),
-// so we don't have to coordinate with the sampler goroutine.
+// so we don't have to coordinate with the sampler goroutine. The
+// walkers also issue only Set* calls (they read stats off the
+// model, not the receiver), so the same guarantee holds.
+//
+// parentCtx is the TUI's lifecycle context — used as the parent
+// for the walker goroutines' derived contexts, so a TUI shutdown
+// also cancels any in-flight walk.
 func tuiInputCapture(
+	parentCtx context.Context,
 	app *tview.Application,
 	rcv tuiReceiver,
 	model *tuiModel,
@@ -288,18 +549,76 @@ func tuiInputCapture(
 			return nil
 		}
 
-		if key := event.Rune(); key == 'q' || key == 'Q' {
+		key := event.Rune()
+		if key == 'q' || key == 'Q' {
 			app.Stop()
 
 			return nil
 		}
 
-		if handleGainKey(rcv, model, event.Rune()) {
+		if key == 'a' || key == 'A' {
+			handleAutoTuneKey(parentCtx, rcv, model)
+
+			return nil
+		}
+
+		if key == 's' || key == 'S' {
+			handleSweepKey(parentCtx, rcv, model)
+
+			return nil
+		}
+
+		// While either walker holds the gain stages, manual gain
+		// keys would race the walker's Set* calls. Drop them
+		// rather than risk a half-applied state.
+		snap := model.snapshot()
+		if snap.autoTune.status == autoTuneRunning || snap.sweep.status == sweepRunning {
+			return nil
+		}
+
+		if handleGainKey(rcv, model, key) {
 			return nil
 		}
 
 		return event
 	}
+}
+
+// handleAutoTuneKey is the 'a' / 'A' dispatcher: starts a fresh
+// walk if no run is in progress, otherwise cancels the running
+// walk. Spawns the walker on a goroutine so the input thread
+// returns to tview immediately and the strip chart keeps
+// redrawing during the walk.
+//
+// If a sweep is in progress, startAutoTune refuses; the cancel
+// fallback is a no-op (autoTuneCancel is nil), which is the
+// behaviour we want — 'a' shouldn't cancel a sweep.
+func handleAutoTuneKey(parentCtx context.Context, rcv tuiReceiver, model *tuiModel) {
+	ctx, started := model.startAutoTune(parentCtx)
+	if !started {
+		model.cancelAutoTune()
+
+		return
+	}
+
+	go runAutoTune(ctx, rcv, model, defaultAutoTuneConfig())
+}
+
+// handleSweepKey is the 's' / 'S' dispatcher. Symmetric to
+// handleAutoTuneKey: starts a fresh sweep if no walker is in
+// flight, otherwise the second-press cancels its own walker
+// (cancelling auto-tune isn't done here because 's' isn't an
+// auto-tune key — the model.cancelSweep no-ops if sweepCancel
+// is nil).
+func handleSweepKey(parentCtx context.Context, rcv tuiReceiver, model *tuiModel) {
+	ctx, started := model.startSweep(parentCtx)
+	if !started {
+		model.cancelSweep()
+
+		return
+	}
+
+	go runSweep(ctx, rcv, model, defaultSweepConfig())
 }
 
 // maxR860Step is the topmost ladder step the R860 tuner exposes
@@ -378,6 +697,389 @@ func clampStep(step int) uint8 {
 	}
 
 	return uint8(step) //nolint:gosec // bounded by the clauses above.
+}
+
+// autoTuneConfig is the tunable surface of runAutoTune. The
+// production walker uses defaultAutoTuneConfig; tests pass a
+// shorter settle / timeout so the table can run inside a regular
+// unit-test deadline.
+type autoTuneConfig struct {
+	// settleDelay matches the library's AutoTuneOptions.SettleDelay:
+	// long enough for the tuner to re-settle after a gain write and
+	// for the URB ring to drop pre-change samples.
+	settleDelay time.Duration
+
+	// satThreshold matches AutoTuneOptions.SaturationThreshold: the
+	// fraction of saturated samples that signals "LNA low enough".
+	satThreshold float64
+
+	// frameTimeout bounds the wait for a fresh sampler frame after
+	// settleDelay. On real hardware a frame lands every 100–200 ms;
+	// 2 s is plenty even under USB jitter. On timeout we proceed
+	// with the stalest stats rather than hanging the walk forever.
+	frameTimeout time.Duration
+
+	// pollInterval is how often waitForFreshFrame re-checks
+	// model.frames. 20 ms is well below the typical frame cadence
+	// so we don't introduce visible per-step latency on top of
+	// settleDelay.
+	pollInterval time.Duration
+}
+
+// defaultAutoTuneConfig returns the production settings. Values
+// match the library's AutoTuneOptions defaults so the TUI walk
+// converges on the same LNA step the headless lib call would.
+func defaultAutoTuneConfig() autoTuneConfig {
+	const (
+		defaultSettleDelay  = 500 * time.Millisecond
+		defaultSatThreshold = 0.05
+		defaultFrameTimeout = 2 * time.Second
+		defaultPollInterval = 20 * time.Millisecond
+	)
+
+	return autoTuneConfig{
+		settleDelay:  defaultSettleDelay,
+		satThreshold: defaultSatThreshold,
+		frameTimeout: defaultFrameTimeout,
+		pollInterval: defaultPollInterval,
+	}
+}
+
+// runAutoTune drives a TUI-side gain auto-tune walk. Pins Mixer
+// and VGA at their maxima, then walks LNA from 15 down until the
+// latest sampler frame reports SaturationFrac ≤ cfg.satThreshold
+// (or LNA hits 0, the saturation floor).
+//
+// We don't call Receiver.AutoTuneGain because the library's
+// implementation issues its own Reads, and the Receiver doc-
+// comment forbids concurrent Reads — the TUI sampler is already
+// the producer. Driving the same algorithm via SetLNAGain and
+// reading SaturationFrac from the live sampler avoids the
+// conflict and gives the operator a live view of the walk via
+// the strip chart and footer.
+//
+// On success the model's gain state matches the converged LNA
+// step and autoTune.completed flips true. On error or
+// cancellation, autoTune.err carries the diagnostic.
+func runAutoTune(ctx context.Context, rcv tuiReceiver, model *tuiModel, cfg autoTuneConfig) {
+	if err := rcv.SetMixerGain(maxR860Step); err != nil {
+		model.failAutoTune(fmt.Errorf("auto-tune: pin mixer: %w", err))
+
+		return
+	}
+
+	if err := rcv.SetVGAGain(maxR860Step); err != nil {
+		model.failAutoTune(fmt.Errorf("auto-tune: pin VGA: %w", err))
+
+		return
+	}
+
+	base := model.snapshot().gain
+	base.mixerStep = maxR860Step
+	base.vgaStep = maxR860Step
+
+	for lnaStep := int(maxR860Step); lnaStep >= 0; lnaStep-- {
+		if err := ctx.Err(); err != nil {
+			model.failAutoTune(fmt.Errorf("auto-tune cancelled: %w", err))
+
+			return
+		}
+
+		step := uint8(lnaStep) //nolint:gosec // loop bounded [0, maxR860Step].
+		if err := rcv.SetLNAGain(step); err != nil {
+			model.failAutoTune(fmt.Errorf("auto-tune: set LNA=%d: %w", lnaStep, err))
+
+			return
+		}
+
+		base.lnaStep = step
+		model.setGain(base)
+
+		iterations := int(maxR860Step) - lnaStep + 1
+		model.setAutoTuneProgress(step, iterations)
+
+		if !waitForFreshFrame(ctx, model, cfg.settleDelay, cfg.frameTimeout, cfg.pollInterval) {
+			model.failAutoTune(fmt.Errorf("auto-tune cancelled: %w", ctx.Err()))
+
+			return
+		}
+
+		sat := model.snapshot().latest.SaturationFrac
+		if sat <= cfg.satThreshold || lnaStep == 0 {
+			model.finishAutoTune(step, sat, iterations)
+
+			return
+		}
+	}
+}
+
+// waitForFreshFrame sleeps settleDelay so the tuner can settle
+// and the URB ring can drop pre-change samples, then polls
+// model.frames until a new frame arrives or frameTimeout
+// expires. Returns false only on ctx cancellation; on timeout
+// returns true so the caller proceeds with whatever stats the
+// model has — a USB stall shouldn't deadlock the auto-tune walk.
+func waitForFreshFrame(
+	ctx context.Context,
+	model *tuiModel,
+	settle, timeout, poll time.Duration,
+) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(settle):
+	}
+
+	framesBefore := model.snapshot().frames
+
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline.C:
+			return true
+		case <-ticker.C:
+			if model.snapshot().frames > framesBefore {
+				return true
+			}
+		}
+	}
+}
+
+// sweepConfig is the tunable surface of runSweep.
+//
+// stride controls grid resolution. stride=3 yields the value
+// set {0,3,6,9,12,15} (6 per dim, 216 cells). stride=5 yields
+// {0,5,10,15} (4 per dim, 64 cells). The walker always probes
+// both 0 and maxR860Step so the endpoints are sampled.
+//
+// satThreshold defines the "acceptable clipping" cut-off used
+// by isBetterCell — same value as the auto-tune (5 %).
+//
+// settleDelay / frameTimeout / pollInterval mirror autoTuneConfig
+// and are passed to waitForFreshFrame after each cell's writes.
+type sweepConfig struct {
+	stride       int
+	settleDelay  time.Duration
+	satThreshold float64
+	frameTimeout time.Duration
+	pollInterval time.Duration
+}
+
+// defaultSweepConfig returns the production settings. stride 3
+// (216 cells) gives readable topology in 1.5–2.5 min; the
+// remaining timings match defaultAutoTuneConfig.
+func defaultSweepConfig() sweepConfig {
+	const (
+		defaultStride       = 3
+		defaultSettleDelay  = 500 * time.Millisecond
+		defaultSatThreshold = 0.05
+		defaultFrameTimeout = 2 * time.Second
+		defaultPollInterval = 20 * time.Millisecond
+	)
+
+	return sweepConfig{
+		stride:       defaultStride,
+		settleDelay:  defaultSettleDelay,
+		satThreshold: defaultSatThreshold,
+		frameTimeout: defaultFrameTimeout,
+		pollInterval: defaultPollInterval,
+	}
+}
+
+// sweepResult is the per-cell measurement runSweep records. lna /
+// mix / vga are the programmed steps; rms / sat are the SampleStats
+// fields the walker uses to score the cell against the running
+// best via isBetterCell.
+type sweepResult struct {
+	lna uint8
+	mix uint8
+	vga uint8
+	rms float64
+	sat float64
+}
+
+// sweepProgress is the mutable state runSweep threads through
+// sweepProbeCell. baseGain is the last-applied gain config (kept
+// so applyGainCell can write all four fields including biasOn);
+// cells / best / bestKnown track the walk's running state.
+type sweepProgress struct {
+	baseGain  gainState
+	cells     int
+	best      sweepResult
+	bestKnown bool
+}
+
+// sweepStepsForStride returns the ladder positions to probe on a
+// single dimension. Always includes 0 and maxR860Step so the
+// corners of the grid are sampled even when stride doesn't
+// divide maxR860Step (e.g., stride=4 → {0,4,8,12,15}).
+func sweepStepsForStride(stride int) []uint8 {
+	if stride <= 0 {
+		stride = 1
+	}
+
+	steps := make([]uint8, 0, (maxR860Step/stride)+2) //nolint:mnd // +2 = both endpoints.
+	for s := 0; s <= maxR860Step; s += stride {
+		steps = append(steps, uint8(s)) //nolint:gosec // s bounded by maxR860Step.
+	}
+
+	if len(steps) == 0 || steps[len(steps)-1] != maxR860Step {
+		steps = append(steps, maxR860Step)
+	}
+
+	return steps
+}
+
+// isBetterCell scores a candidate against the current best.
+// "Better" is defined as: prefer cells that meet the saturation
+// threshold; among those, prefer the highest RMS (loudest non-
+// clipping signal); among cells that don't meet the threshold,
+// prefer the lowest saturation. This matches auto-tune's intent
+// — "max usable gain" — generalised to three dimensions.
+func isBetterCell(candidate, current sweepResult, satThreshold float64) bool {
+	newOk := candidate.sat <= satThreshold
+	oldOk := current.sat <= satThreshold
+
+	switch {
+	case newOk && !oldOk:
+		return true
+	case !newOk && oldOk:
+		return false
+	case newOk:
+		return candidate.rms > current.rms
+	default:
+		return candidate.sat < current.sat
+	}
+}
+
+// applyGainCell writes all three gain stages then publishes the
+// new gain state to the model. Pulled out so runSweep and (the
+// best-cell apply step at the end of) runSweep don't duplicate
+// the three-set / one-update sequence.
+func applyGainCell(
+	rcv tuiReceiver,
+	model *tuiModel,
+	base gainState,
+	lna, mix, vga uint8,
+) (gainState, error) {
+	if err := rcv.SetLNAGain(lna); err != nil {
+		return base, fmt.Errorf("set LNA=%d: %w", lna, err)
+	}
+
+	if err := rcv.SetMixerGain(mix); err != nil {
+		return base, fmt.Errorf("set Mix=%d: %w", mix, err)
+	}
+
+	if err := rcv.SetVGAGain(vga); err != nil {
+		return base, fmt.Errorf("set VGA=%d: %w", vga, err)
+	}
+
+	base.lnaStep = lna
+	base.mixerStep = mix
+	base.vgaStep = vga
+	model.setGain(base)
+
+	return base, nil
+}
+
+// runSweep drives a TUI-side 3D gain sweep. For each (LNA, Mix,
+// VGA) cell on the configured grid it writes the gain stages,
+// waits for a fresh sampler frame, scores the cell, and updates
+// the running best. After the grid is exhausted it applies the
+// best config so the post-sweep state is the winner.
+//
+// Same reason for not using a hypothetical library AutoTune3D as
+// runAutoTune: the Receiver is single-producer on the bulk
+// endpoint, so any library helper that issued its own Reads
+// would race the TUI sampler. Driving Set* directly and reading
+// stats off the live sampler is the only conflict-free shape.
+func runSweep(ctx context.Context, rcv tuiReceiver, model *tuiModel, cfg sweepConfig) {
+	steps := sweepStepsForStride(cfg.stride)
+	total := len(steps) * len(steps) * len(steps)
+	model.setSweepTotal(total)
+
+	state := sweepProgress{baseGain: model.snapshot().gain}
+
+	for _, lna := range steps {
+		for _, mix := range steps {
+			for _, vga := range steps {
+				if cont := sweepProbeCell(ctx, rcv, model, cfg, &state, lna, mix, vga); !cont {
+					return
+				}
+			}
+		}
+	}
+
+	if state.bestKnown {
+		if _, err := applyGainCell(rcv, model, state.baseGain,
+			state.best.lna, state.best.mix, state.best.vga); err != nil {
+			model.failSweep(fmt.Errorf("sweep: apply best: %w", err))
+
+			return
+		}
+	}
+
+	model.finishSweep()
+}
+
+// sweepProbeCell is the inner-loop body of runSweep, factored
+// out so runSweep stays inside revive's funlen / cognitive
+// budgets. Returns false when the caller should stop iterating
+// (ctx cancelled or a setter failed); the model has already been
+// updated with the appropriate terminal state in those cases.
+func sweepProbeCell(
+	ctx context.Context,
+	rcv tuiReceiver,
+	model *tuiModel,
+	cfg sweepConfig,
+	state *sweepProgress,
+	lna, mix, vga uint8,
+) bool {
+	if err := ctx.Err(); err != nil {
+		model.failSweep(fmt.Errorf("sweep cancelled: %w", err))
+
+		return false
+	}
+
+	newBase, err := applyGainCell(rcv, model, state.baseGain, lna, mix, vga)
+	if err != nil {
+		model.failSweep(fmt.Errorf("sweep: %w", err))
+
+		return false
+	}
+
+	state.baseGain = newBase
+	state.cells++
+	model.setSweepProgress(lna, mix, vga, state.cells)
+
+	if !waitForFreshFrame(ctx, model, cfg.settleDelay, cfg.frameTimeout, cfg.pollInterval) {
+		model.failSweep(fmt.Errorf("sweep cancelled: %w", ctx.Err()))
+
+		return false
+	}
+
+	snap := model.snapshot()
+	cell := sweepResult{
+		lna: lna, mix: mix, vga: vga,
+		rms: snap.latest.RMS,
+		sat: snap.latest.SaturationFrac,
+	}
+
+	if !state.bestKnown || isBetterCell(cell, state.best, cfg.satThreshold) {
+		state.best = cell
+		state.bestKnown = true
+
+		model.recordSweepBest(cell)
+	}
+
+	return true
 }
 
 // runSampler is the goroutine that pulls raw I/Q chunks from the
@@ -547,7 +1249,7 @@ func runRedraw(
 			panes.histogram.SetText(renderHistogram(snap.latest.MagnitudeHistogram, histW, histH))
 			panes.strip.SetText(renderStripChart(snap.history, stripW, stripH))
 			panes.spectrum.SetText(renderSpectrum(snap.latestSpectrum, displayTop, baselineDB, specW, specH))
-			panes.footer.SetText(renderFooter(snap.gain, snap.lastErr, snap.lastControlErr))
+			panes.footer.SetText(renderFooter(snap.gain, snap.autoTune, snap.sweep, snap.lastErr, snap.lastControlErr))
 		})
 	}
 }
@@ -569,24 +1271,139 @@ func renderHeader(stats rtl2832u.SampleStats, frames uint64) string {
 	)
 }
 
-// renderFooter draws the gain-control state, keybindings line,
-// and any sampler / control error. Errors are coloured red so a
-// hung USB or rejected gain write shows up at a glance.
-func renderFooter(state gainState, samplerErr, controlErr error) string {
+// renderFooter draws the gain-control state, walker progress or
+// summary, keybindings line, and any sampler / control error.
+// Errors are coloured red; the completion summaries green.
+//
+// Precedence (highest first): in-flight sweep > in-flight auto-
+// tune > sampler error > control error > sweep error > auto-
+// tune error > most-recent completion summary > default
+// keybind hints. In-flight states win because they tell the
+// operator the gain stages are not theirs to change right now.
+//
+// When both walkers have completion summaries to show,
+// completedAt timestamps disambiguate so only the most-recent
+// one is rendered.
+func renderFooter(
+	state gainState,
+	autoTune autoTuneState,
+	sweep sweepState,
+	samplerErr, controlErr error,
+) string {
 	gain := fmt.Sprintf(
 		"LNA=%d Mix=%d VGA=%d bias=%s",
 		state.lnaStep, state.mixerStep, state.vgaStep, biasLabel(state.biasOn),
 	)
+
+	if sweep.status == sweepRunning {
+		return renderSweepRunningFooter(gain, sweep)
+	}
+
+	const totalAutoTuneSteps = maxR860Step + 1 // 16 LNA positions
+	if autoTune.status == autoTuneRunning {
+		return fmt.Sprintf(
+			"[yellow]auto-tune: probing LNA=%d (step %d/%d)[-]  ·  %s  ·  [::b]a[::-] cancel  ·  [::b]q[::-] quit",
+			autoTune.currentLNA, autoTune.iterations, totalAutoTuneSteps, gain,
+		)
+	}
 
 	switch {
 	case samplerErr != nil:
 		return fmt.Sprintf("[red]sampler error: %v[-]  ·  %s  ·  [::b]q[::-] quit", samplerErr, gain)
 	case controlErr != nil:
 		return fmt.Sprintf("%s  ·  [red]last control: %v[-]  ·  [::b]q[::-] quit", gain, controlErr)
-	default:
-		return gain + "  ·  [::b]l[::-]/[::b]L[::-] LNA  [::b]m[::-]/[::b]M[::-] Mix  " +
-			"[::b]v[::-]/[::b]V[::-] VGA  [::b]b[::-] bias  ·  [::b]q[::-] quit"
+	case sweep.err != nil:
+		return fmt.Sprintf(
+			"%s  ·  [red]sweep: %v[-]  ·  [::b]s[::-] retry  ·  [::b]q[::-] quit",
+			gain, sweep.err,
+		)
+	case autoTune.err != nil:
+		return fmt.Sprintf(
+			"%s  ·  [red]auto-tune: %v[-]  ·  [::b]a[::-] retry  ·  [::b]q[::-] quit",
+			gain, autoTune.err,
+		)
 	}
+
+	if summary, ok := renderMostRecentCompletion(gain, autoTune, sweep); ok {
+		return summary
+	}
+
+	return gain + "  ·  [::b]l[::-]/[::b]L[::-] LNA  [::b]m[::-]/[::b]M[::-] Mix  " +
+		"[::b]v[::-]/[::b]V[::-] VGA  [::b]b[::-] bias  ·  [::b]a[::-] auto-tune  " +
+		"[::b]s[::-] sweep  ·  [::b]q[::-] quit"
+}
+
+// renderSweepRunningFooter formats the in-flight sweep line.
+// Pulled out so renderFooter stays inside revive's funlen
+// budget; the live line is busy (cell N/total, current cell,
+// best-so-far, cancel hint).
+func renderSweepRunningFooter(gain string, sweep sweepState) string {
+	if sweep.bestKnown {
+		const percent = 100.0
+
+		return fmt.Sprintf(
+			"[yellow]sweep: cell %d/%d · probing LNA=%d Mix=%d VGA=%d[-]  ·  "+
+				"[green]best LNA=%d Mix=%d VGA=%d (sat=%.2f%% rms=%.1f)[-]  ·  "+
+				"[::b]s[::-] cancel  ·  [::b]q[::-] quit",
+			sweep.cells, sweep.total,
+			sweep.currentLNA, sweep.currentMix, sweep.currentVGA,
+			sweep.bestLNA, sweep.bestMix, sweep.bestVGA,
+			sweep.bestSat*percent, sweep.bestRMS,
+		)
+	}
+
+	return fmt.Sprintf(
+		"[yellow]sweep: cell %d/%d · probing LNA=%d Mix=%d VGA=%d[-]  ·  %s  ·  "+
+			"[::b]s[::-] cancel  ·  [::b]q[::-] quit",
+		sweep.cells, sweep.total,
+		sweep.currentLNA, sweep.currentMix, sweep.currentVGA,
+		gain,
+	)
+}
+
+// renderMostRecentCompletion picks the most-recent walker
+// summary to render in the footer. Returns "", false when
+// neither walker has a completion to show, so renderFooter can
+// fall through to the default keybind hints.
+func renderMostRecentCompletion(gain string, autoTune autoTuneState, sweep sweepState) (string, bool) {
+	switch {
+	case sweep.completed && (!autoTune.completed || sweep.completedAt.After(autoTune.completedAt)):
+		return renderSweepCompletedFooter(gain, sweep), true
+	case autoTune.completed:
+		return renderAutoTuneCompletedFooter(gain, autoTune), true
+	}
+
+	return "", false
+}
+
+// renderAutoTuneCompletedFooter formats the auto-tune sticky
+// summary shown after a converged run.
+func renderAutoTuneCompletedFooter(gain string, autoTune autoTuneState) string {
+	const percent = 100.0
+
+	return fmt.Sprintf(
+		"%s  ·  [green]auto-tune: LNA=%d sat=%.2f%% in %d steps[-]  ·  [::b]a[::-] re-run  ·  [::b]q[::-] quit",
+		gain, autoTune.finalLNA, autoTune.finalSat*percent, autoTune.iterations,
+	)
+}
+
+// renderSweepCompletedFooter formats the sweep sticky summary
+// shown after the walker applies the best cell.
+func renderSweepCompletedFooter(gain string, sweep sweepState) string {
+	const percent = 100.0
+
+	if !sweep.bestKnown {
+		return gain + "  ·  [yellow]sweep: no cells probed[-]  ·  [::b]s[::-] re-run  ·  [::b]q[::-] quit"
+	}
+
+	return fmt.Sprintf(
+		"%s  ·  [green]sweep: best LNA=%d Mix=%d VGA=%d (sat=%.2f%% rms=%.1f) over %d cells[-]  ·  "+
+			"[::b]s[::-] re-run  ·  [::b]q[::-] quit",
+		gain,
+		sweep.bestLNA, sweep.bestMix, sweep.bestVGA,
+		sweep.bestSat*percent, sweep.bestRMS,
+		sweep.cells,
+	)
 }
 
 // biasLabel renders the bias-tee state as the on/off token the

@@ -143,7 +143,8 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 	flagSet.BoolVar(&cfg.tui, "tui", false,
 		"open a live magnitude-histogram + strip-chart TUI instead of running the "+
 			"one-shot probe/capture. Useful for diagnosing gain regime and chain stability "+
-			"interactively. q or Esc quits.")
+			"interactively. Keys: l/L m/M v/V step LNA/Mixer/VGA, b toggle bias-tee, "+
+			"a auto-tune LNA, s 3D gain sweep, q or Esc quits.")
 
 	if err := flagSet.Parse(args); err != nil {
 		return cfg, fmt.Errorf("flag parse: %w", err)

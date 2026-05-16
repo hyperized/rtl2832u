@@ -183,8 +183,20 @@ The `--tui` mode opens a tview UI driven by a sampling goroutine that pulls raw 
 │                                  │ │ │ at carrier, ▲ on the axis     │ │
 │                                  │ └──────────────────────────────────┘ │
 ├─────────────────────────────────────────────────────────────────────────┤
-└─ footer: q quit · esc quit · last sampler error if any ─────────────────┘
+└─ footer: LNA=N Mix=N VGA=N bias=on/off · keybinds · errors / auto-tune ─┘
 ```
+
+Live controls (footer keybinds):
+
+- **`l` / `L`** — step LNA up / down
+- **`m` / `M`** — step Mixer up / down
+- **`v` / `V`** — step VGA up / down
+- **`b`** — toggle bias-tee
+- **`a`** — run TUI-driven gain auto-tune (pins Mixer + VGA at 15, walks LNA down until `SaturationFrac` ≤ 5 % or LNA hits 0). Press `a` again while it's running to cancel. The footer shows live progress (`probing LNA=N (step k/16)`) and, after a run completes, a green summary (`auto-tune: LNA=N sat=X.XX% in Y steps`) that stays visible so you can compare against manual exploration.
+- **`s`** — run TUI-driven 3D sweep across LNA × Mixer × VGA on a stride-3 grid (`{0,3,6,9,12,15}` per axis = 216 cells, ~1.5–2.5 min). Picks the cell with the highest RMS where `SaturationFrac` ≤ 5 %; falls back to the lowest-saturation cell if none meet the threshold. Footer shows `cell N/216 · probing LNA=L Mix=M VGA=V · best LNA=A Mix=B VGA=C (sat=X.XX% rms=Y.Y)` live; on completion the walker applies the winning cell and the footer shows the sticky summary. Press `s` again to cancel. Mutually exclusive with `a`.
+- **`q`** / **`Esc`** — quit
+
+Manual gain keys are suppressed while either walker is running so the operator's keystrokes don't race the walker's `Set*` calls. The footer's completion summary always shows whichever of auto-tune / sweep finished most recently (`completedAt` timestamp comparison).
 
 Key design choices:
 
@@ -193,6 +205,7 @@ Key design choices:
 - **Long-term baseline tracker**: a 30 s EMA of the 25th-percentile bin, drawn as a horizontal dashed line. Anything sticking up above the line is signal worth attention.
 - **Carrier marker `│`**: a vertical guide through the chart at the tuned-frequency column, plus a `▲` on the X-axis. Visual anchor for "is the peak where I tuned?".
 - **Status / advice debounce**: both banners read from a 20-frame trailing average so they don't flicker on bursty traffic.
+- **TUI-side auto-tune**: the walker drives `Receiver.SetLNAGain` directly and reads `SaturationFrac` off the live sampler rather than calling `Receiver.AutoTuneGain` — the library's variant issues its own `Read` calls, and the receiver is single-producer on the bulk endpoint. This way the strip chart visibly updates as auto-tune steps so the operator can see the convergence.
 
 The TUI is built on `github.com/rivo/tview` + `github.com/gdamore/tcell` — pulled in only by `cmd/rtl-probe`, so library consumers (e.g. downstream demodulators) don't transitively depend on them.
 
