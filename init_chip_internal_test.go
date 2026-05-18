@@ -399,12 +399,12 @@ func TestResetSampleBufferIssuesHaltRunAndSyncTrigger(t *testing.T) {
 
 	got := writesOnly(mock.calls)
 	usbIdx := blockIdx(chipBlockUSB)
-	pg0 := demodIdx(demodPage0)
+	pg1 := demodIdx(demodPage1)
 	want := []capturedCall{
 		wantWrite(regUSBEPACtl, usbIdx, 0x10, 0x02),
 		wantWrite(regUSBEPACtl, usbIdx, 0x00, 0x00),
-		wantWrite(encodeDemodAddr(regDemodSoftReset), pg0, softResetAsserted),
-		wantWrite(encodeDemodAddr(regDemodSoftReset), pg0, softResetReleased),
+		wantWrite(encodeDemodAddr(regDemodSoftReset), pg1, softResetAsserted),
+		wantWrite(encodeDemodAddr(regDemodSoftReset), pg1, softResetReleased),
 	}
 
 	if !reflect.DeepEqual(got, want) {

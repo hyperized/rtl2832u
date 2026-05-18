@@ -364,16 +364,19 @@ func (r *rtl2832u) initUSB() error {
 //     between the demod and the USB block. Without this the bulk
 //     endpoint is stalled and the kernel returns EPIPE on the
 //     first REAPURB.
-//   - Demod soft-reset on page 0, register 0x01: 0x14 (asserted) →
+//   - Demod soft-reset on page 1, register 0x01: 0x14 (asserted) →
 //     0x10 (released). This is librtlsdr's "trigger sync mode (also
 //     flushes the FIFO)" pulse — the demod's sample FIFO needs a
 //     resync after PLL re-locks or any sample-rate / centre-freq
 //     change, otherwise no URBs ever complete.
 //
-// The page-0 soft-reset target shares its bit layout with the
-// page-1 soft-reset that resetDemod uses during chip init; the
-// chip exposes the same control bits on both pages so different
-// sub-blocks can be reset without a second page switch.
+// Earlier revisions of this file targeted page 0 with the
+// speculative claim that the chip mirrors soft-reset bits across
+// pages; neither the RTL2832U datasheet nor osmocom librtlsdr
+// support that, and the page-1 register is the only documented
+// soft-reset surface (used by rtlsdr_set_sample_rate and chip
+// init). Page-1 makes the intent unambiguous and matches the
+// upstream reference.
 func (r *rtl2832u) ResetSampleBuffer() error {
 	if err := r.writeWord(chipBlockUSB, regUSBEPACtl, usbEPACtlReset); err != nil {
 		return fmt.Errorf("rtl2832u: reset sample buffer (halt): %w", err)
@@ -383,11 +386,11 @@ func (r *rtl2832u) ResetSampleBuffer() error {
 		return fmt.Errorf("rtl2832u: reset sample buffer (run): %w", err)
 	}
 
-	if err := r.demodWriteByte(demodPage0, regDemodSoftReset, softResetAsserted); err != nil {
+	if err := r.demodWriteByte(demodPage1, regDemodSoftReset, softResetAsserted); err != nil {
 		return fmt.Errorf("rtl2832u: trigger sync mode (assert): %w", err)
 	}
 
-	if err := r.demodWriteByte(demodPage0, regDemodSoftReset, softResetReleased); err != nil {
+	if err := r.demodWriteByte(demodPage1, regDemodSoftReset, softResetReleased); err != nil {
 		return fmt.Errorf("rtl2832u: trigger sync mode (release): %w", err)
 	}
 
