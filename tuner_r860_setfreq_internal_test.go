@@ -78,8 +78,11 @@ func TestSetFreq1090MHzWires(t *testing.T) {
 		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860RFMux, 0x60}},
 		// tf_c=0, full byte.
 		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860TrackingFilt, 0x00}},
-		// xtal cap clear, mask 0x0b: shadow=0x6c → 0x6c & 0xf4 = 0x64.
-		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860XtalCap, 0x64}},
+		// xtal cap clear, mask 0x03 (CAPX[1:0] per datasheet R16
+		// and librtlsdr r82xx_set_tv_standard): shadow=0x6c →
+		// 0x6c & 0xfc = 0x6c (no actual change since the init
+		// shadow already has CAPX=00).
+		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860XtalCap, 0x6c}},
 		// IMR mem 1 clear, mask 0x3f: shadow=0xc0 → 0xc0.
 		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860IMRMem1, 0xc0}},
 		// IMR mem 2 clear, mask 0x3f: shadow=0x40 → 0x40.
@@ -95,8 +98,10 @@ func TestSetFreq1090MHzWires(t *testing.T) {
 		// them in place, so opRead sees the wire form (0x04 at
 		// index 4 → bitrevs to 0x20 → vcoFineTune = 2).
 		{kind: opRead, addr: r860I2CAddr, data: []byte{0x00, 0x00, 0x00, 0x00, 0x04}},
-		// divNum=0 << 5: shadow=0x64 (after setMux), mask=0xe0 → 0x04.
-		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860DivNum, 0x04}},
+		// divNum=0 << 5: shadow=0x6c (after setMux, init value
+		// preserved because mask=0x03 doesn't touch bit 3),
+		// mask=0xe0 → 0x6c & 0x1f = 0x0c.
+		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860DivNum, 0x0c}},
 		// ni=6, si=0 → full byte 0x06.
 		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860NiSi, 0x06}},
 		// pwSDM: sdm != 0 so value=0; shadow=0x80, mask=0x08 → 0x80.
@@ -305,10 +310,11 @@ func TestSetFreqShadowReflectsWrites(t *testing.T) {
 		reg  uint8
 		want uint8
 	}{
-		// divNum's shadow is 0x04 after setMux clears 0x10's lower
-		// bits (init 0x6c → 0x64) and the PLL pass leaves divNum=0
-		// in bits [7:5] (0x64 & ~0xe0 = 0x04).
-		{regR860DivNum, 0x04},
+		// divNum's shadow is 0x0c after setMux's xtal-cap clear
+		// (mask 0x03 only touches CAPX[1:0], leaving the init
+		// value 0x6c unchanged in bit 3) and the PLL pass leaves
+		// divNum=0 in bits [7:5] (0x6c & ~0xe0 = 0x0c).
+		{regR860DivNum, 0x0c},
 		{regR860NiSi, 0x06},
 		{regR860SDMHigh, 0xD8},
 		{regR860SDMLow, 0xE4},

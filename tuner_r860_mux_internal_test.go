@@ -83,7 +83,7 @@ func TestSetMux1090MHzWires(t *testing.T) {
 		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860OpenDrain, 0x30}},    // mask 0x08, value 0
 		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860RFMux, 0x60}},        // mask 0xc3, value 0x40
 		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860TrackingFilt, 0x00}}, // full byte
-		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860XtalCap, 0x64}},      // mask 0x0b, value 0
+		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860XtalCap, 0x6c}},      // mask 0x03, value 0
 		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860IMRMem1, 0xc0}},      // mask 0x3f, value 0
 		{kind: opWrite, addr: r860I2CAddr, data: []byte{regR860IMRMem2, 0x40}},      // mask 0x3f, value 0
 		{kind: opDisable},

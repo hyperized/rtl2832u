@@ -29,8 +29,10 @@ const (
 	// among the on-chip tracking-filter coefficient tables.
 	regR860TrackingFilt uint8 = 0x1b
 
-	// regR860XtalCap (0x10) — bits [3:0,1] hold xtal-cap selection.
-	// The basic init clears them; we follow.
+	// regR860XtalCap (0x10) — bits [1:0] are CAPX, the internal
+	// xtal-load capacitor selection (00 = no cap, 01 = 10 pF,
+	// 10 = 20 pF, 11 = 30 pF; per R820T2 datasheet R16). The
+	// basic init clears them; we follow.
 	regR860XtalCap uint8 = 0x10
 
 	// regR860IMRMem1 (0x08) and regR860IMRMem2 (0x09) hold the
@@ -44,7 +46,7 @@ const (
 const (
 	maskR860OpenDrain uint8 = 0x08
 	maskR860RFMux     uint8 = 0xc3
-	maskR860XtalCap   uint8 = 0x0b
+	maskR860XtalCap   uint8 = 0x03 // CAPX[1:0] only — datasheet R16
 	maskR860IMRMem    uint8 = 0x3f
 
 	// muxClearedBits is the value-bits common to several setMux
