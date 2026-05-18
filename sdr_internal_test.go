@@ -805,6 +805,9 @@ type fakeBackend struct {
 	lastBiasEnable bool
 	biasCalls      int
 	setBiasErr     error
+	biasState      bool
+	getBiasCalls   int
+	getBiasErr     error
 }
 
 func (f *fakeBackend) Read(_ context.Context, _ []byte) (int, error) {
@@ -855,6 +858,12 @@ func (f *fakeBackend) SetBiasTee(enable bool) error {
 	f.biasCalls++
 
 	return f.setBiasErr
+}
+
+func (f *fakeBackend) GetBiasTee() (bool, error) {
+	f.getBiasCalls++
+
+	return f.biasState, f.getBiasErr
 }
 
 func TestReceiverReadDelegatesToBackend(t *testing.T) {
@@ -1056,5 +1065,32 @@ func TestReceiverSetBiasTeeDelegates(t *testing.T) {
 
 	if !fake.lastBiasEnable || fake.biasCalls != 1 {
 		t.Errorf("bias state = %v calls=%d, want true / 1", fake.lastBiasEnable, fake.biasCalls)
+	}
+}
+
+func TestReceiverGetBiasTeeDelegates(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeBackend{biasState: true}
+	rcv := &Receiver{cfg: defaultConfig(), backend: fake}
+
+	enabled, err := rcv.GetBiasTee()
+	if err != nil {
+		t.Fatalf("GetBiasTee: %v", err)
+	}
+
+	if !enabled || fake.getBiasCalls != 1 {
+		t.Errorf("enabled=%v calls=%d, want true / 1", enabled, fake.getBiasCalls)
+	}
+}
+
+func TestReceiverGetBiasTeeWrapsBackendError(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeBackend{getBiasErr: errFakeRead}
+	rcv := &Receiver{cfg: defaultConfig(), backend: fake}
+
+	if _, err := rcv.GetBiasTee(); !errors.Is(err, errFakeRead) {
+		t.Errorf("err = %v, want wrapping errFakeRead", err)
 	}
 }

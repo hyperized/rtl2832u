@@ -445,6 +445,7 @@ type backend interface {
 	SetMixerGain(step uint8) error
 	SetVGAGain(step uint8) error
 	SetBiasTee(enable bool) error
+	GetBiasTee() (bool, error)
 }
 
 // Open enumerates RTL-SDR devices and opens the one at the configured
@@ -602,4 +603,25 @@ func (r *Receiver) SetBiasTee(enable bool) error {
 	}
 
 	return nil
+}
+
+// GetBiasTee reads the chip's GPO (GPIO output latch) register
+// and reports whether the bias-tee line (default GPIO0) is
+// currently driven high. GPO returns the latched output value
+// rather than the live input pin level, so the result is
+// well-defined for the bias-tee's output-mode pin (datasheet
+// §10.2.2 makes GPI undefined for output pins). Updates via this
+// driver's SetBiasTee and via third-party tools using rtl_biast
+// are both reflected — the chip-level latch is the source of
+// truth.
+//
+// One USB control transfer per call; safe to invoke at UI-tick
+// cadence while sample streaming is in progress.
+func (r *Receiver) GetBiasTee() (bool, error) {
+	enabled, err := r.backend.GetBiasTee()
+	if err != nil {
+		return false, fmt.Errorf("rtl2832u: get bias-tee: %w", err)
+	}
+
+	return enabled, nil
 }

@@ -53,7 +53,7 @@ func TestSetBiasTeeEnableSequence(t *testing.T) {
 		mockController: &mockController{},
 		readQueue: [][]byte{
 			{0xff}, // first GPD read (configure direction)
-			{0x00}, // first GPOE read (enable output)
+			{0x00}, // GPOE read (enable output driver)
 			{0x00}, // GPO read (drive bit)
 		},
 	}
@@ -63,22 +63,36 @@ func TestSetBiasTeeEnableSequence(t *testing.T) {
 		t.Fatalf("setBiasTee: %v", err)
 	}
 
-	// Six calls: read+write × three SYS regs (GPD, GPOE, GPO).
+	// Six calls: read+write × three SYS regs in order GPD, GPOE, GPO.
+	// Mismatching addresses here would catch a regression of the
+	// 0x0001/0x0002/0x0003-vs-0x3001/0x3003/0x3004 bug.
 	if got := len(mock.calls); got != 6 {
 		t.Fatalf("call count = %d, want 6", got)
 	}
 
-	// Verify the final write to GPO carries bit 0 set (high).
-	gpoWrite := mock.calls[5]
-	if gpoWrite.direction != dirOut {
-		t.Errorf("calls[5].direction = %q, want %q", gpoWrite.direction, dirOut)
+	wantSequence := []struct {
+		dir     string
+		addr    uint16
+		comment string
+	}{
+		{dirIn, regSYSGPD, "GPD read"},
+		{dirOut, regSYSGPD, "GPD write"},
+		{dirIn, regSYSGPOE, "GPOE read"},
+		{dirOut, regSYSGPOE, "GPOE write"},
+		{dirIn, regSYSGPO, "GPO read"},
+		{dirOut, regSYSGPO, "GPO write"},
 	}
 
-	if gpoWrite.value != regSYSGPO {
-		t.Errorf("calls[5].value = %#x, want %#x (regSYSGPO)", gpoWrite.value, regSYSGPO)
+	for i, want := range wantSequence {
+		got := mock.calls[i]
+
+		if got.direction != want.dir || got.value != want.addr {
+			t.Errorf("calls[%d] = (%q, %#x), want (%q, %#x) — %s",
+				i, got.direction, got.value, want.dir, want.addr, want.comment)
+		}
 	}
 
-	if got := gpoWrite.data[0] & 0x01; got != 0x01 {
+	if got := mock.calls[5].data[0] & 0x01; got != 0x01 {
 		t.Errorf("GPO write payload bit 0 = %#x, want 0x01 (drive high)", got)
 	}
 }
@@ -243,5 +257,82 @@ func TestSetBiasTeeWrapsGPOWriteFailure(t *testing.T) {
 
 	if err := chip.setBiasTee(0, true); !errors.Is(err, errFakeControlOut) {
 		t.Errorf("err = %v, want wrapping errFakeControlOut on GPO write", err)
+	}
+}
+
+// TestGetBiasTeeReadsLiveBit verifies the chip-side getBiasTee
+// reads regSYSGPO (the output latch) and reports the bit for the
+// requested GPIO. The bias-tee pin is configured as output, so
+// GPO is the documented read-back surface; reading GPI on an
+// output-mode pin is undefined per datasheet §10.2.2.
+func TestGetBiasTeeReadsLiveBit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		gpoValue byte
+		gpio     uint8
+		want     bool
+	}{
+		{name: "bit 0 low", gpoValue: 0x00, gpio: 0, want: false},
+		{name: "bit 0 high", gpoValue: 0x01, gpio: 0, want: true},
+		{name: "bit 0 high, others set too", gpoValue: 0xa1, gpio: 0, want: true},
+		{name: "bit 0 low, others set", gpoValue: 0xa0, gpio: 0, want: false},
+		{name: "bit 3 high", gpoValue: 0x08, gpio: 3, want: true},
+		{name: "bit 7 high", gpoValue: 0x80, gpio: 7, want: true},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			mock := &biasTeeMockController{
+				mockController: &mockController{},
+				readQueue:      [][]byte{{testCase.gpoValue}},
+			}
+			chip := newRTL2832U(mock)
+
+			got, err := chip.getBiasTee(testCase.gpio)
+			if err != nil {
+				t.Fatalf("getBiasTee: %v", err)
+			}
+
+			if got != testCase.want {
+				t.Errorf("getBiasTee enabled = %v, want %v", got, testCase.want)
+			}
+
+			if len(mock.calls) != 1 {
+				t.Fatalf("calls = %d, want 1 (single GPO read)", len(mock.calls))
+			}
+
+			if call := mock.calls[0]; call.direction != dirIn || call.value != regSYSGPO {
+				t.Errorf("calls[0] = (%q, %#x), want (%q, %#x) — GPO read",
+					call.direction, call.value, dirIn, regSYSGPO)
+			}
+		})
+	}
+}
+
+func TestGetBiasTeeRejectsOutOfRangeGPIO(t *testing.T) {
+	t.Parallel()
+
+	mock := &biasTeeMockController{mockController: &mockController{}}
+	chip := newRTL2832U(mock)
+
+	if _, err := chip.getBiasTee(8); !errors.Is(err, ErrInvalidGPIO) {
+		t.Errorf("err = %v, want wrapping ErrInvalidGPIO", err)
+	}
+}
+
+func TestGetBiasTeeWrapsReadFailure(t *testing.T) {
+	t.Parallel()
+
+	mock := &biasTeeMockController{
+		mockController: &mockController{inErr: errFakeControlIn},
+	}
+	chip := newRTL2832U(mock)
+
+	if _, err := chip.getBiasTee(0); !errors.Is(err, errFakeControlIn) {
+		t.Errorf("err = %v, want wrapping errFakeControlIn", err)
 	}
 }

@@ -655,3 +655,14 @@ func (b *linuxBackend) SetBiasTee(enable bool) error {
 
 	return nil
 }
+
+// GetBiasTee reads back the bias-tee GPIO state from the chip on
+// the same GPIO line SetBiasTee writes to.
+func (b *linuxBackend) GetBiasTee() (bool, error) {
+	enabled, err := b.chip.getBiasTee(b.biasTeeGPIO)
+	if err != nil {
+		return false, fmt.Errorf("rtl2832u: get bias-tee: %w", err)
+	}
+
+	return enabled, nil
+}

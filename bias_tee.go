@@ -22,11 +22,14 @@ import (
 // implements bias-tee follows that convention. Clones with
 // alternate wiring need to override the GPIO via SetBiasTeeGPIO.
 //
-// Three SYS registers participate:
+// Four SYS registers participate. Per the RTL2832U datasheet §10
+// ("address is defined by offset value with base address 0x3000"),
+// the absolute addresses are the table's offsets plus 0x3000:
 //
-//   GPO  (0x0001)  per-bit GPIO output value
-//   GPOE (0x0002)  per-bit output-enable; 1 = drive, 0 = high-Z
-//   GPD  (0x0003)  per-bit direction; 0 = output, 1 = input
+//   GPO  (0x3001)  RW  per-bit GPIO output latch
+//   GPI  (0x3002)  R   per-bit GPIO input level (live pin voltage)
+//   GPOE (0x3003)  RW  per-bit output enable; 1 = drive, 0 = high-Z
+//   GPD  (0x3004)  RW  per-bit direction; 0 = output, 1 = input
 //
 // Toggle sequence per librtlsdr's rtlsdr_set_bias_tee_gpio:
 //
@@ -34,18 +37,43 @@ import (
 //   2. set   the bit in GPOE (enable the output driver)
 //   3. set/clear the bit in GPO (drive high / low)
 //
-// We implement the three steps as read-modify-writes against the
-// chip's SYS block so we don't disturb other GPIO bits the user
-// might have configured. Call frequency is low (twice per session
-// at most) so the extra USB round-trips are immaterial.
+// We implement the three writes as read-modify-writes against the
+// SYS block so we don't disturb other GPIO bits the user might
+// have configured. Read-back uses GPO (not GPI): the bias-tee pin
+// is configured as an OUTPUT, and per datasheet §10.2.2 "Input
+// Value of GPIO N. Valid only when GPIO N is defined as input
+// pin." — so GPI is undefined for output pins. GPO holds the
+// latched output value, mirroring whatever was last written, and
+// librtlsdr's set_gpio_bit uses GPO for its own RMW. We keep
+// regSYSGPI defined for completeness / future input-mode use but
+// the bias-tee path itself never reads it.
+//
+// Call frequency is low (twice per session at most for sets, ~1 Hz
+// for reads) so the USB round-trips are immaterial.
+//
+// Cross-references: Linux kernel drivers/media/usb/dvb-usb-v2/
+// rtl28xxu.h SYS_GPIO_* defines, osmocom librtlsdr enum sys_reg.
+// All three agree on the 0x300x addressing.
 
 const (
-	// regSYSGPO holds the GPIO output values (per-bit).
-	regSYSGPO uint16 = 0x0001
-	// regSYSGPOE holds the GPIO output-enable bits.
-	regSYSGPOE uint16 = 0x0002
-	// regSYSGPD holds the GPIO direction (0 = output, 1 = input).
-	regSYSGPD uint16 = 0x0003
+	// regSYSGPO holds the per-bit GPIO output latch (RW). Used
+	// by setBiasTee for the drive write and by getBiasTee for
+	// read-back of the latched output value.
+	regSYSGPO uint16 = 0x3001
+	// regSYSGPI holds the per-bit GPIO input pin level (R-only).
+	// Not consumed by the bias-tee path — the bias-tee pin is
+	// configured as an output and per RTL2832U datasheet §10.2.2
+	// "Input Value of GPIO N. Valid only when GPIO N is defined
+	// as input pin." Declared here so the SYS-block GPIO triplet
+	// reads complete in code and future input-mode callers can
+	// pick it up without re-discovering the address.
+	//
+	//nolint:unused // documentation; consumed by future input-mode callers.
+	regSYSGPI uint16 = 0x3002
+	// regSYSGPOE holds the per-bit GPIO output-enable.
+	regSYSGPOE uint16 = 0x3003
+	// regSYSGPD holds the per-bit GPIO direction (0 = output).
+	regSYSGPD uint16 = 0x3004
 
 	// defaultBiasTeeGPIO is the GPIO pin librtlsdr drives for
 	// bias-tee on every common RTL-SDR dongle. Clones with
@@ -134,4 +162,34 @@ func (r *rtl2832u) setBiasTee(gpio uint8, enable bool) error {
 	}
 
 	return r.writeGPIOBit(gpio, enable)
+}
+
+// getBiasTee reads the chip's GPO (output latch) register and
+// reports whether the bias-tee bit for the configured GPIO is
+// driven high. GPO returns the latched output value — exactly
+// what we last wrote with SetBiasTee — so a re-read after a write
+// is the canonical state for an output-mode pin.
+//
+// Why GPO and not GPI: per datasheet §10.2.2, "Input Value of
+// GPIO N. Valid only when GPIO N is defined as input pin." The
+// bias-tee GPIO is configured as an OUTPUT (configureGPIOOutput
+// clears GPD bit, sets GPOE bit), so GPI is undefined for it.
+// GPO is read-modify-written by librtlsdr's set_gpio_bit and is
+// the documented surface for read-back of an output pin.
+//
+// Caveat: external tools that flip the bit through their own
+// rtlsdr handle (rtl_biast, another process) will also update
+// GPO via the same code path, so we still see those changes —
+// the chip-level latch is the source of truth.
+func (r *rtl2832u) getBiasTee(gpio uint8) (bool, error) {
+	if gpio > biasTeeMaxGPIO {
+		return false, fmt.Errorf("%w: gpio=%d", ErrInvalidGPIO, gpio)
+	}
+
+	value, err := r.readByte(chipBlockSYS, regSYSGPO)
+	if err != nil {
+		return false, fmt.Errorf("rtl2832u: read GPIO%d state: %w", gpio, err)
+	}
+
+	return value&(1<<gpio) != 0, nil
 }
