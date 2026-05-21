@@ -165,7 +165,11 @@ rtl-probe --capture cap.iq --capture-bytes $((2*1024*1024))
 rtl-probe --tui
 ```
 
-The `--tui` mode opens a tview UI driven by a sampling goroutine that pulls raw I/Q chunks (~5 Hz) and derives both `SampleStats` and an FFT spectrum from the same buffer:
+`--tui` opens an in-process terminal UI for interactive gain stepping, live signal-quality diagnostics, and a 3D LNA × Mix × VGA sweep. Useful for bringing up a new dongle, diagnosing a yield drop after an antenna change, characterising a SAW filter or external LNA, or eyeballing a sweep before baking the winning gain config into a daemon.
+
+![rtl-probe --tui showing the live magnitude histogram, RMS / saturation / DC strip chart, Welch-averaged FFT spectrum, and the gain / auto-tune / sweep keybind footer](rtl2832u.png)
+
+The TUI is driven by a sampling goroutine that pulls raw I/Q chunks (~5 Hz) and derives both `SampleStats` and an FFT spectrum from the same buffer:
 
 ```
 ┌─ header: live samples / RMS / peak / sat % / DC values ─────────────────┐
