@@ -42,6 +42,11 @@ import (
 // version is overridden at link time with -ldflags "-X main.version=...".
 var version = "0.0.0-dev"
 
+// errCaptureSecondsNegative is the sentinel for a sub-zero
+// --capture-seconds value. Wrapped (not returned bare) so callers
+// keep the formatted detail (got X) while errors.Is checks work.
+var errCaptureSecondsNegative = errors.New("--capture-seconds must be >= 0")
+
 // gainStageFlagAGC is the magic value meaning "leave this stage on
 // AGC". Negative numbers are rejected by R860 step validation, so
 // reusing -1 (which is also rtl2832u.GainAGC) is unambiguous.
@@ -86,8 +91,9 @@ type config struct {
 
 	probeBytes int
 
-	capturePath  string
-	captureBytes int
+	capturePath    string
+	captureBytes   int
+	captureSeconds int
 
 	skipProbe bool
 	tui       bool
@@ -138,6 +144,9 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 			"Format: interleaved uint8 IQ, rtl_sdr / dump1090 --ifile compatible.")
 	flagSet.IntVar(&cfg.captureBytes, "capture-bytes", defaultCaptureBytes,
 		"number of IQ bytes to capture when --capture is set; rounded up to a 32 KiB multiple internally")
+	flagSet.IntVar(&cfg.captureSeconds, "capture-seconds", 0,
+		"capture duration in seconds; when >0 overrides --capture-bytes "+
+			"(bytes = seconds × sample-rate × 2 for UC8 interleaved)")
 	flagSet.BoolVar(&cfg.skipProbe, "no-probe", false,
 		"skip the AGC SignalStats probe; useful when you only want a capture")
 	flagSet.BoolVar(&cfg.tui, "tui", false,
@@ -152,6 +161,18 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 
 	cfg.centerFreqHz = uint32(center) //nolint:gosec // user-supplied Hz; chip max ≤ 1.766 GHz fits uint32.
 	cfg.sampleRateHz = uint32(rate)   //nolint:gosec // sample rate ≤ 3.2 MS/s fits uint32.
+
+	if cfg.captureSeconds < 0 {
+		_, _ = fmt.Fprintf(stderr, "rtl-probe: --capture-seconds must be >= 0, got %d\n", cfg.captureSeconds)
+
+		return cfg, fmt.Errorf("%w: got %d", errCaptureSecondsNegative, cfg.captureSeconds)
+	}
+
+	if cfg.captureSeconds > 0 {
+		const bytesPerSample = 2 // UC8: interleaved uint8 I and Q
+
+		cfg.captureBytes = int(int64(cfg.captureSeconds) * int64(cfg.sampleRateHz) * bytesPerSample)
+	}
 
 	return cfg, nil
 }

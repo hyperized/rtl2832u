@@ -53,12 +53,13 @@ var (
 )
 
 const (
-	flagNoProbe       = "-no-probe"
-	flagCapture       = "-capture"
-	flagCaptureBytes  = "-capture-bytes"
-	flagProbeBytes    = "-probe-bytes"
-	flagBytesSmall    = "1024"
-	captureSinkStdout = "-"
+	flagNoProbe        = "-no-probe"
+	flagCapture        = "-capture"
+	flagCaptureBytes   = "-capture-bytes"
+	flagCaptureSeconds = "-capture-seconds"
+	flagProbeBytes     = "-probe-bytes"
+	flagBytesSmall     = "1024"
+	captureSinkStdout  = "-"
 )
 
 func (f *fakeReceiver) Read(_ context.Context, dst []byte) (int, error) {
@@ -174,6 +175,10 @@ func TestParseConfigDefaults(t *testing.T) {
 		t.Errorf("captureBytes = %d, want %d", cfg.captureBytes, defaultCaptureBytes)
 	}
 
+	if cfg.captureSeconds != 0 {
+		t.Errorf("captureSeconds = %d, want 0", cfg.captureSeconds)
+	}
+
 	if cfg.biasTee != biasTeeUnset {
 		t.Errorf("biasTee = %d, want %d", cfg.biasTee, biasTeeUnset)
 	}
@@ -243,6 +248,83 @@ func TestParseConfigBadFlag(t *testing.T) {
 
 	if _, err := parseConfig([]string{"-nope"}, &stderr); err == nil {
 		t.Fatal("parseConfig: want error, got nil")
+	}
+}
+
+func TestParseConfigCaptureSecondsDefaultRate(t *testing.T) {
+	t.Parallel()
+
+	var stderr bytes.Buffer
+
+	cfg, err := parseConfig([]string{flagCaptureSeconds, "10"}, &stderr)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+
+	want := 10 * int(rtl2832u.DefaultSampleRateHz) * 2
+	if cfg.captureBytes != want {
+		t.Errorf("captureBytes = %d, want %d", cfg.captureBytes, want)
+	}
+
+	if cfg.captureSeconds != 10 {
+		t.Errorf("captureSeconds = %d, want 10", cfg.captureSeconds)
+	}
+}
+
+func TestParseConfigCaptureSecondsOverridesBytes(t *testing.T) {
+	t.Parallel()
+
+	var stderr bytes.Buffer
+
+	cfg, err := parseConfig([]string{
+		"-sample-rate", "2400000",
+		flagCaptureSeconds, "5",
+		flagCaptureBytes, "99999",
+	}, &stderr)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+
+	const wantBytes = 5 * 2_400_000 * 2
+	if cfg.captureBytes != wantBytes {
+		t.Errorf("captureBytes = %d, want %d (seconds × rate × 2)", cfg.captureBytes, wantBytes)
+	}
+}
+
+func TestParseConfigCaptureSecondsZeroLeavesBytes(t *testing.T) {
+	t.Parallel()
+
+	var stderr bytes.Buffer
+
+	cfg, err := parseConfig([]string{
+		flagCaptureSeconds, "0",
+		flagCaptureBytes, "131072",
+	}, &stderr)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+
+	if cfg.captureBytes != 131072 {
+		t.Errorf("captureBytes = %d, want 131072 (explicit --capture-bytes preserved)", cfg.captureBytes)
+	}
+}
+
+func TestParseConfigCaptureSecondsNegative(t *testing.T) {
+	t.Parallel()
+
+	var stderr bytes.Buffer
+
+	_, err := parseConfig([]string{flagCaptureSeconds, "-1"}, &stderr)
+	if err == nil {
+		t.Fatal("parseConfig: want error for negative --capture-seconds, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "capture-seconds") {
+		t.Errorf("err = %q, want it to mention capture-seconds", err)
+	}
+
+	if !strings.Contains(stderr.String(), "capture-seconds") {
+		t.Errorf("stderr = %q, want diagnostic mentioning capture-seconds", stderr.String())
 	}
 }
 
