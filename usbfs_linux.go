@@ -567,31 +567,6 @@ func (b *linuxBackend) Close() error {
 	return firstErr
 }
 
-// drainOrphanedURBs reaps any URBs the kernel still holds after the
-// stream goroutine has exited. Bounded by the ring size so a
-// runaway kernel state cannot stall Close indefinitely; any reap
-// error is logged at warn level and ignored — the goal is best-
-// effort cleanup before we release the interface and close the fd.
-// Warn (not Debug) because a reap error here indicates the kernel
-// is in an unexpected state and is the kind of signal a user
-// looking at logs after a "device wedged on Close" report will
-// want to see without flipping verbosity.
-func (b *linuxBackend) drainOrphanedURBs() {
-	for range b.urbs {
-		hasURB, err := b.drainNextURB()
-		if err != nil {
-			b.logger.Warn("rtl2832u: drain orphaned URB",
-				slog.String("error", err.Error()))
-
-			return
-		}
-
-		if !hasURB {
-			return
-		}
-	}
-}
-
 // DroppedSampleChunks satisfies the backend interface; see the
 // method's doc on the public Receiver type for behaviour.
 func (b *linuxBackend) DroppedSampleChunks() uint64 {
@@ -665,4 +640,29 @@ func (b *linuxBackend) GetBiasTee() (bool, error) {
 	}
 
 	return enabled, nil
+}
+
+// drainOrphanedURBs reaps any URBs the kernel still holds after the
+// stream goroutine has exited. Bounded by the ring size so a
+// runaway kernel state cannot stall Close indefinitely; any reap
+// error is logged at warn level and ignored — the goal is best-
+// effort cleanup before we release the interface and close the fd.
+// Warn (not Debug) because a reap error here indicates the kernel
+// is in an unexpected state and is the kind of signal a user
+// looking at logs after a "device wedged on Close" report will
+// want to see without flipping verbosity.
+func (b *linuxBackend) drainOrphanedURBs() {
+	for range b.urbs {
+		hasURB, err := b.drainNextURB()
+		if err != nil {
+			b.logger.Warn("rtl2832u: drain orphaned URB",
+				slog.String("error", err.Error()))
+
+			return
+		}
+
+		if !hasURB {
+			return
+		}
+	}
 }
